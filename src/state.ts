@@ -6,12 +6,16 @@ import type {
   PlanAttempt,
   PlanStatus,
   PlanStore,
+  PriorityPair,
+  PriorityPairAttempt,
+  PriorityPairResult,
+  PriorityPairStatus,
   ReservationPlan,
   ReservationResult,
 } from "./types.js";
-import { normalizeSlots, validateDate } from "./validation.js";
+import { normalizeSlots, validateDate, validateSlot } from "./validation.js";
 
-const EMPTY_STORE: PlanStore = { version: 1, plans: [] };
+const EMPTY_STORE: PlanStore = { version: 1, plans: [], priorityPairs: [] };
 
 export async function ensureStateDirectories(): Promise<void> {
   await mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -23,6 +27,10 @@ export async function loadStore(): Promise<PlanStore> {
     const parsed = JSON.parse(await readFile(PLANS_FILE, "utf8")) as PlanStore;
     if (parsed.version !== 1 || !Array.isArray(parsed.plans)) {
       throw new Error("计划文件格式不受支持");
+    }
+    parsed.priorityPairs ??= [];
+    if (!Array.isArray(parsed.priorityPairs)) {
+      throw new Error("优先级计划文件格式不受支持");
     }
     return parsed;
   } catch (error) {
@@ -66,6 +74,58 @@ export async function addPlan(
   return plan;
 }
 
+export async function addPriorityPair(
+  targetDate: string,
+  highSlot: string,
+  lowSlot: string,
+): Promise<PriorityPair> {
+  validateDate(targetDate);
+  validateSlot(highSlot);
+  validateSlot(lowSlot);
+  if (highSlot === lowSlot) {
+    throw new Error("高、低优先级时段不能相同");
+  }
+
+  const store = await loadStore();
+  const now = new Date().toISOString();
+  const highPlan: ReservationPlan = {
+    id: randomUUID().slice(0, 8),
+    resourceId: RESOURCE_ID,
+    targetDate,
+    slots: [highSlot],
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+    attempts: [],
+  };
+  const lowPlan: ReservationPlan = {
+    id: randomUUID().slice(0, 8),
+    resourceId: RESOURCE_ID,
+    targetDate,
+    slots: [lowSlot],
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+    attempts: [],
+  };
+  const pair: PriorityPair = {
+    id: randomUUID().slice(0, 8),
+    targetDate,
+    highSlot,
+    lowSlot,
+    highPlanId: highPlan.id,
+    lowPlanId: lowPlan.id,
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+    attempts: [],
+  };
+  store.plans.push(highPlan, lowPlan);
+  store.priorityPairs.push(pair);
+  await saveStore(store);
+  return pair;
+}
+
 export async function findPlan(planId: string): Promise<ReservationPlan> {
   const store = await loadStore();
   const plan = store.plans.find((item) => item.id === planId);
@@ -73,6 +133,15 @@ export async function findPlan(planId: string): Promise<ReservationPlan> {
     throw new Error(`找不到计划：${planId}`);
   }
   return plan;
+}
+
+export async function findPriorityPair(pairId: string): Promise<PriorityPair> {
+  const store = await loadStore();
+  const pair = store.priorityPairs.find((item) => item.id === pairId);
+  if (!pair) {
+    throw new Error(`找不到优先级计划：${pairId}`);
+  }
+  return pair;
 }
 
 export async function updatePlan(
@@ -96,3 +165,25 @@ export async function updatePlan(
   return plan;
 }
 
+export async function updatePriorityPair(
+  pairId: string,
+  status: PriorityPairStatus,
+  attempt?: PriorityPairAttempt,
+  result?: PriorityPairResult,
+): Promise<PriorityPair> {
+  const store = await loadStore();
+  const pair = store.priorityPairs.find((item) => item.id === pairId);
+  if (!pair) {
+    throw new Error(`找不到优先级计划：${pairId}`);
+  }
+  pair.status = status;
+  pair.updatedAt = new Date().toISOString();
+  if (attempt) {
+    pair.attempts.push(attempt);
+  }
+  if (result) {
+    pair.result = result;
+  }
+  await saveStore(store);
+  return pair;
+}

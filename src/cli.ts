@@ -5,9 +5,19 @@ import {
   clearStoredCredentials,
   saveCredentialsFromDialog,
 } from "./credentials.js";
-import { addPlan, findPlan, loadStore } from "./state.js";
+import {
+  addPlan,
+  addPriorityPair,
+  findPlan,
+  findPriorityPair,
+  loadStore,
+} from "./state.js";
 import { runReservation } from "./reservation.js";
-import { installOneShotSchedule } from "./scheduler.js";
+import { runPriorityPair } from "./priority.js";
+import {
+  installOneShotSchedule,
+  installPrioritySchedule,
+} from "./scheduler.js";
 import type { RunMode } from "./types.js";
 import { releaseDateFor, shanghaiDate } from "./validation.js";
 
@@ -80,22 +90,59 @@ plan
     console.log(JSON.stringify(created, null, 2));
   });
 plan
+  .command("add-priority")
+  .description("创建先高后低、分别提交的两个串行时段")
+  .requiredOption("--date <YYYY-MM-DD>", "预约日期")
+  .requiredOption("--high-slot <HH:mm-HH:mm>", "高优先级时段")
+  .requiredOption("--low-slot <HH:mm-HH:mm>", "低优先级时段")
+  .action(async (options: {
+    date: string;
+    highSlot: string;
+    lowSlot: string;
+  }) => {
+    const created = await addPriorityPair(
+      options.date,
+      options.highSlot,
+      options.lowSlot,
+    );
+    console.log(JSON.stringify(created, null, 2));
+  });
+plan
   .command("list")
   .description("列出预约计划")
   .action(async () => {
     const store = await loadStore();
-    if (!store.plans.length) {
+    if (!store.plans.length && !store.priorityPairs.length) {
       console.log("暂无预约计划");
       return;
     }
-    console.table(
-      store.plans.map((item) => ({
-        id: item.id,
-        date: item.targetDate,
-        slots: item.slots.join(" > "),
-        status: item.status,
-      })),
+    const childPlanIds = new Set(
+      store.priorityPairs.flatMap((item) => [item.highPlanId, item.lowPlanId]),
     );
+    const independentPlans = store.plans.filter((item) => !childPlanIds.has(item.id));
+    if (independentPlans.length) {
+      console.log("普通计划");
+      console.table(
+        independentPlans.map((item) => ({
+          id: item.id,
+          date: item.targetDate,
+          slots: item.slots.join(" > "),
+          status: item.status,
+        })),
+      );
+    }
+    if (store.priorityPairs.length) {
+      console.log("优先级串行计划");
+      console.table(
+        store.priorityPairs.map((item) => ({
+          id: item.id,
+          date: item.targetDate,
+          high: item.highSlot,
+          low: item.lowSlot,
+          status: item.status,
+        })),
+      );
+    }
   });
 
 program
@@ -126,6 +173,37 @@ program
       prepareMinutes,
     );
     console.log("SCHEDULED：一次性任务已安装");
+    console.log(JSON.stringify(scheduled, null, 2));
+  });
+
+program
+  .command("schedule-priority")
+  .description("安装高优先级准点、低优先级随后立即执行的一次性任务")
+  .requiredOption("--pair <id>", "优先级计划 ID")
+  .requiredOption("--at <ISO-8601>", "高优先级提交时刻，必须包含时区")
+  .option("--prepare-minutes <minutes>", "提前登录并保持唤醒的分钟数", "3")
+  .action(async (options: { pair: string; at: string; prepareMinutes: string }) => {
+    const selectedPair = await findPriorityPair(options.pair);
+    if (selectedPair.status === "confirmed") {
+      throw new Error("该优先级计划的两个时段都已预约成功，不会创建重复调度");
+    }
+    const at = parseTimestamp(options.at, "--at");
+    const prepareMinutes = Number(options.prepareMinutes);
+    if (!Number.isInteger(prepareMinutes)) {
+      throw new Error("--prepare-minutes 必须是整数");
+    }
+    const releaseDate = releaseDateFor(selectedPair.targetDate);
+    if (shanghaiDate(at) !== releaseDate) {
+      throw new Error(
+        `目标日期 ${selectedPair.targetDate} 应在 ${releaseDate} 抢订，调度日期不匹配`,
+      );
+    }
+    const scheduled = await installPrioritySchedule(
+      selectedPair.id,
+      at,
+      prepareMinutes,
+    );
+    console.log("SCHEDULED：优先级串行任务已安装");
     console.log(JSON.stringify(scheduled, null, 2));
   });
 
@@ -166,6 +244,50 @@ program
     console.log(result.message);
     console.log(JSON.stringify(result, null, 2));
     if (result.status === "failed" || result.status === "ambiguous") {
+      process.exitCode = 2;
+    }
+  });
+
+program
+  .command("run-priority")
+  .description("串行执行高、低优先级两个预约计划")
+  .requiredOption("--pair <id>", "优先级计划 ID")
+  .option("--dry-run", "依次停在两个时段的确认预约前")
+  .option("--submit", "依次真实提交两个时段")
+  .option("--not-before <ISO-8601>", "高优先级预登录后等待到指定时刻")
+  .option("--max-lateness-seconds <seconds>", "高优先级超过指定秒数仍未开始则放弃", "120")
+  .action(async (options: {
+    pair: string;
+    dryRun?: boolean;
+    submit?: boolean;
+    notBefore?: string;
+    maxLatenessSeconds: string;
+  }) => {
+    if (Boolean(options.dryRun) === Boolean(options.submit)) {
+      throw new Error("必须且只能指定 --dry-run 或 --submit");
+    }
+    const mode: RunMode = options.dryRun ? "dry-run" : "submit";
+    if (mode === "dry-run" && options.notBefore) {
+      throw new Error("--not-before 只允许用于 --submit");
+    }
+    const notBefore = options.notBefore
+      ? parseTimestamp(options.notBefore, "--not-before")
+      : undefined;
+    const maxLatenessSeconds = Number(options.maxLatenessSeconds);
+    if (!Number.isFinite(maxLatenessSeconds) || maxLatenessSeconds <= 0) {
+      throw new Error("--max-lateness-seconds 必须是正数");
+    }
+    const selectedPair = await findPriorityPair(options.pair);
+    if (mode === "submit" && selectedPair.status === "confirmed") {
+      throw new Error("该优先级计划的两个时段都已预约成功，不会重复提交");
+    }
+    const result = await runPriorityPair(selectedPair, mode, {
+      notBefore,
+      maxLatenessMs: maxLatenessSeconds * 1_000,
+    });
+    console.log(result.message);
+    console.log(JSON.stringify(result, null, 2));
+    if (["failed", "partial", "ambiguous"].includes(result.status)) {
       process.exitCode = 2;
     }
   });

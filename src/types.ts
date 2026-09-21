@@ -39,8 +39,47 @@ export interface ReservationPlan {
   result?: ReservationResult;
 }
 
+export type PriorityPairStatus =
+  | "pending"
+  | "running"
+  | "ready"
+  | "confirmed"
+  | "partial"
+  | "failed"
+  | "ambiguous";
+
+export interface PriorityPairAttempt {
+  at: string;
+  mode: RunMode;
+  result: PriorityPairStatus;
+  message: string;
+}
+
+export interface PriorityPairResult {
+  mode: RunMode;
+  pairId: string;
+  status: Exclude<PriorityPairStatus, "pending" | "running">;
+  message: string;
+  high: ReservationResult;
+  low: ReservationResult;
+}
+
+export interface PriorityPair {
+  id: string;
+  targetDate: string;
+  highSlot: string;
+  lowSlot: string;
+  highPlanId: string;
+  lowPlanId: string;
+  status: PriorityPairStatus;
+  createdAt: string;
+  updatedAt: string;
+  attempts: PriorityPairAttempt[];
+  result?: PriorityPairResult;
+}
+
 export interface PlanStore {
   version: 1;
   plans: ReservationPlan[];
+  priorityPairs: PriorityPair[];
 }
-

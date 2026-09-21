@@ -48,8 +48,9 @@ export interface OneShotSchedule {
   logPath: string;
 }
 
-export async function installOneShotSchedule(
-  planId: string,
+async function installSchedule(
+  labelSuffix: string,
+  cliArguments: string[],
   at: Date,
   prepareMinutes: number,
 ): Promise<OneShotSchedule> {
@@ -65,7 +66,7 @@ export async function installOneShotSchedule(
   if (uid === undefined) {
     throw new Error("当前系统不支持用户级 launchd 调度");
   }
-  const label = `cn.edu.fudan.courtscript.${planId}`;
+  const label = `cn.edu.fudan.courtscript.${labelSuffix}`;
   const schedulerDir = join(STATE_DIR, "scheduler");
   const launchAgentsDir = join(process.env.HOME ?? "", "Library", "LaunchAgents");
   if (!process.env.HOME) {
@@ -77,22 +78,19 @@ export async function installOneShotSchedule(
   const runnerPath = join(schedulerDir, `${label}.mjs`);
   const logPath = join(schedulerDir, `${label}.log`);
   const plistPath = join(launchAgentsDir, `${label}.plist`);
-  const binPath = join(PROJECT_ROOT, "bin", "courtscript.js");
   const atIso = at.toISOString();
   const serviceTarget = `gui/${uid}/${label}`;
   const runner = `
 import { spawn } from "node:child_process";
 import { unlink } from "node:fs/promises";
 
+const commandArguments = ${JSON.stringify([
+  process.execPath,
+  join(PROJECT_ROOT, "bin", "courtscript.js"),
+])}.concat(${JSON.stringify(cliArguments)});
 const child = spawn("/usr/bin/caffeinate", [
   "-dimsu",
-  ${JSON.stringify(process.execPath)},
-  ${JSON.stringify(binPath)},
-  "run",
-  "--plan", ${JSON.stringify(planId)},
-  "--submit",
-  "--not-before", ${JSON.stringify(atIso)},
-  "--max-lateness-seconds", "120"
+  ...commandArguments
 ], {
   cwd: ${JSON.stringify(PROJECT_ROOT)},
   env: {...process.env, TZ: "Asia/Shanghai"},
@@ -164,4 +162,42 @@ process.exitCode = exitCode;
     plistPath,
     logPath,
   };
+}
+
+export async function installOneShotSchedule(
+  planId: string,
+  at: Date,
+  prepareMinutes: number,
+): Promise<OneShotSchedule> {
+  return installSchedule(
+    planId,
+    [
+      "run",
+      "--plan", planId,
+      "--submit",
+      "--not-before", at.toISOString(),
+      "--max-lateness-seconds", "120",
+    ],
+    at,
+    prepareMinutes,
+  );
+}
+
+export async function installPrioritySchedule(
+  pairId: string,
+  at: Date,
+  prepareMinutes: number,
+): Promise<OneShotSchedule> {
+  return installSchedule(
+    `priority.${pairId}`,
+    [
+      "run-priority",
+      "--pair", pairId,
+      "--submit",
+      "--not-before", at.toISOString(),
+      "--max-lateness-seconds", "120",
+    ],
+    at,
+    prepareMinutes,
+  );
 }
