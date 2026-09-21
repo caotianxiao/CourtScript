@@ -1,0 +1,424 @@
+import { LAUNCH_PATH, RESOURCE_ID } from "./constants.js";
+import { artifactPaths, writeResultLog } from "./logging.js";
+import {
+  captureCourtWindow,
+  closeCourtWindow,
+  executeCourtJavaScript,
+  focusCourtTab,
+  stopDedicatedEdge,
+  waitForCourtJavaScript,
+} from "./edge-apple-events.js";
+import { openAuthenticatedReservationPage } from "./booking-browser.js";
+import { updatePlan } from "./state.js";
+import type {
+  ReservationPlan,
+  ReservationResult,
+  RunMode,
+} from "./types.js";
+import { addCalendarDays, shanghaiDate } from "./validation.js";
+
+const PAGE_TIMEOUT = 30_000;
+
+export interface ReservationRunOptions {
+  notBefore?: Date;
+  maxLatenessMs?: number;
+}
+
+async function waitUntilRelease(
+  notBefore: Date,
+  maxLatenessMs: number,
+): Promise<void> {
+  const latestStart = notBefore.getTime() + maxLatenessMs;
+  if (Date.now() > latestStart) {
+    throw new Error(`已错过预约执行窗口：${notBefore.toISOString()}`);
+  }
+  while (Date.now() < notBefore.getTime()) {
+    const remaining = notBefore.getTime() - Date.now();
+    await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 30_000)));
+  }
+  if (Date.now() > latestStart) {
+    throw new Error(`唤醒或登录延误，已超过预约执行窗口：${notBefore.toISOString()}`);
+  }
+}
+
+async function reloadReservationTable(): Promise<void> {
+  await executeCourtJavaScript("location.reload(); JSON.stringify({reloading: true})");
+  await waitForCourtJavaScript<{ ready: boolean; url: string }>(
+    `JSON.stringify({
+      ready: Boolean(document.querySelector('.week_calendar')),
+      url: location.href
+    })`,
+    (value) => value.ready && value.url.includes("reservationInfo?id=1055"),
+    PAGE_TIMEOUT,
+    "预约资源刷新",
+  );
+}
+
+async function displayedRange(): Promise<[string, string]> {
+  const output = await executeCourtJavaScript(`(() => {
+    const start = document.querySelector('input[placeholder="开始日期"]');
+    const end = document.querySelector('input[placeholder="结束日期"]');
+    return JSON.stringify([start ? start.value : '', end ? end.value : '']);
+  })()`);
+  return JSON.parse(output) as [string, string];
+}
+
+async function moveToTargetWeek(targetDate: string): Promise<void> {
+  for (let step = 0; step < 110; step += 1) {
+    const [start, end] = await displayedRange();
+    if (targetDate >= start && targetDate <= end) {
+      return;
+    }
+    const label = targetDate < start ? "前一周" : "后一周";
+    const result = JSON.parse(await executeCourtJavaScript(`(() => {
+      const label = ${JSON.stringify(label)};
+      const candidates = Array.from(document.querySelectorAll('button,a,span,div'))
+        .filter((item) => item.innerText && item.innerText.trim() === label);
+      candidates.sort((a, b) => a.children.length - b.children.length);
+      const control = candidates[0];
+      if (!control) return JSON.stringify({clicked: false});
+      control.click();
+      return JSON.stringify({clicked: true});
+    })()`)) as { clicked?: boolean };
+    if (!result.clicked) {
+      throw new Error(`页面缺少“${label}”控件`);
+    }
+    await waitForCourtJavaScript<{ start: string }>(
+      `(() => JSON.stringify({
+        start: document.querySelector('input[placeholder="开始日期"]')?.value || ''
+      }))()`,
+      (value) => value.start !== start,
+      PAGE_TIMEOUT,
+      `切换${label}`,
+    );
+  }
+  throw new Error(`无法导航到目标日期：${targetDate}`);
+}
+
+interface SlotSelection {
+  slot: string;
+  availability: string;
+}
+
+async function selectSlot(
+  targetDate: string,
+  slots: string[],
+): Promise<SlotSelection> {
+  const output = await executeCourtJavaScript(`(() => {
+    const targetDate = ${JSON.stringify(targetDate)};
+    const slots = ${JSON.stringify(slots)};
+    const times = Array.from(
+      document.querySelectorAll('.left_time dd.resource_item_info'),
+    ).map((item) => item.innerText.trim());
+    if (times.length !== 14) {
+      return JSON.stringify({error: '页面时段数量异常：期望 14，实际 ' + times.length});
+    }
+    const columns = Array.from(document.querySelectorAll('.reservation_data'));
+    const matches = columns.filter((column) =>
+      Array.from(column.querySelectorAll('.week_header span'))
+        .some((span) => span.innerText.trim() === targetDate),
+    );
+    if (matches.length !== 1) {
+      return JSON.stringify({error: '无法唯一定位日期列：' + targetDate});
+    }
+    const cells = Array.from(matches[0].querySelectorAll('dd.resource_item_info'));
+    for (const slot of slots) {
+      const index = times.indexOf(slot);
+      const cell = index >= 0 ? cells[index] : undefined;
+      if (!cell) continue;
+      const text = cell.innerText.trim();
+      if (!text.includes('可预约') || !cell.classList.contains('can_active')) continue;
+      cell.scrollIntoView({block: 'center'});
+      cell.click();
+      return JSON.stringify({slot, availability: text});
+    }
+    return JSON.stringify({error: '首选和备选时段均不可预约：' + slots.join(', ')});
+  })()`);
+  const result = JSON.parse(output) as SlotSelection & { error?: string };
+  if (result.error) {
+    throw new Error(result.error);
+  }
+  await waitForCourtJavaScript<{ summary: boolean; phone: boolean }>(
+    `(() => {
+      const expected = ${JSON.stringify(`${targetDate} ${result.slot}`)};
+      const summary = Array.from(document.querySelectorAll('*'))
+        .some((item) => typeof item.innerText === 'string'
+          && item.innerText.trim().replace(/\\s+/g, ' ') === expected);
+      const phone = document.querySelector('input[placeholder="请输入手机号"]');
+      return JSON.stringify({summary, phone: Boolean(phone && phone.value.trim())});
+    })()`,
+    (value) => value.summary && value.phone,
+    PAGE_TIMEOUT,
+    "核验预约日期、时段和预填手机号",
+  );
+  return { slot: result.slot, availability: result.availability };
+}
+
+async function installLaunchMonitor(): Promise<void> {
+  await executeCourtJavaScript(`(() => {
+    if (!window.__courtScriptLaunchMonitor) {
+      const launchPath = ${JSON.stringify(LAUNCH_PATH)};
+      const performanceCount = () => performance.getEntriesByType('resource')
+        .filter((entry) => {
+          try {
+            return new URL(entry.name, location.href).pathname === launchPath;
+          } catch {
+            return false;
+          }
+        }).length;
+      window.__courtScriptLaunchMonitor = {
+        count: 0,
+        performanceBaseline: performanceCount(),
+      };
+      const originalFetch = window.fetch;
+      if (originalFetch) {
+        window.fetch = function(input, init) {
+          const url = typeof input === 'string' ? input : input && input.url;
+          if (url && new URL(url, location.href).pathname === launchPath) {
+            window.__courtScriptLaunchMonitor.count += 1;
+          }
+          return originalFetch.call(this, input, init);
+        };
+      }
+      const originalOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__courtScriptUrl = String(url);
+        return originalOpen.call(this, method, url, ...rest);
+      };
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send = function(body) {
+        if (this.__courtScriptUrl
+            && new URL(this.__courtScriptUrl, location.href).pathname === launchPath) {
+          window.__courtScriptLaunchMonitor.count += 1;
+        }
+        return originalSend.call(this, body);
+      };
+    }
+    return JSON.stringify({installed: true});
+  })()`);
+}
+
+async function countLaunchRequests(): Promise<number> {
+  const output = await executeCourtJavaScript(`(() => {
+    const monitor = window.__courtScriptLaunchMonitor;
+    const launchPath = ${JSON.stringify(LAUNCH_PATH)};
+    const performanceCount = performance.getEntriesByType('resource')
+      .filter((entry) => {
+        try {
+          return new URL(entry.name, location.href).pathname === launchPath;
+        } catch {
+          return false;
+        }
+      }).length - (monitor?.performanceBaseline ?? 0);
+    return JSON.stringify({
+      count: Math.max(monitor?.count ?? 0, performanceCount, 0),
+    });
+  })()`);
+  const result = JSON.parse(output) as { count?: number };
+  return Number(result.count) || 0;
+}
+
+async function captchaVisible(): Promise<boolean> {
+  const output = await executeCourtJavaScript(`JSON.stringify({
+    challenge: /滑块|验证码|captcha/i.test(document.body?.innerText || '')
+  })`);
+  return Boolean((JSON.parse(output) as { challenge?: boolean }).challenge);
+}
+
+async function submitReservation(): Promise<void> {
+  const output = await executeCourtJavaScript(`(() => {
+    const button = Array.from(document.querySelectorAll('button'))
+      .find((item) => item.innerText.trim() === '确认预约');
+    if (!button) return JSON.stringify({clicked: false});
+    button.click();
+    return JSON.stringify({clicked: true});
+  })()`);
+  if (!(JSON.parse(output) as { clicked?: boolean }).clicked) {
+    throw new Error("页面缺少“确认预约”按钮");
+  }
+}
+
+async function verifyAppointment(targetDate: string, slot: string): Promise<boolean> {
+  const output = await executeCourtJavaScript(`(() => {
+    const nav = Array.from(document.querySelectorAll('*'))
+      .filter((item) => typeof item.innerText === 'string'
+        && item.innerText.trim() === '我的预约')
+      .sort((a, b) => a.children.length - b.children.length)[0];
+    if (!nav) return JSON.stringify({clicked: false});
+    nav.click();
+    return JSON.stringify({clicked: true});
+  })()`);
+  if (!(JSON.parse(output) as { clicked?: boolean }).clicked) {
+    return false;
+  }
+  return waitForCourtJavaScript<{ found: boolean }>(
+    `(() => {
+      const targetDate = ${JSON.stringify(targetDate)};
+      const slot = ${JSON.stringify(slot)};
+      const found = Array.from(document.querySelectorAll('tr')).some((row) => {
+        const text = row.innerText.replace(/\\s+/g, ' ').trim();
+        return text.includes(targetDate)
+          && text.includes(slot)
+          && !text.includes('已取消')
+          && (text.includes('已预约') || text.includes('取消预约'));
+      });
+      return JSON.stringify({found});
+    })()`,
+    (value) => value.found,
+    12_000,
+    "检查我的预约",
+  ).then(() => true).catch(() => false);
+}
+
+export async function runReservation(
+  plan: ReservationPlan,
+  mode: RunMode,
+  options: ReservationRunOptions = {},
+): Promise<ReservationResult> {
+  if (plan.resourceId !== RESOURCE_ID) {
+    throw new Error(`不支持的资源 ID：${plan.resourceId}`);
+  }
+  const today = shanghaiDate();
+  if (plan.targetDate <= today) {
+    throw new Error(`目标日期必须晚于今天：${plan.targetDate}`);
+  }
+  if (plan.targetDate > addCalendarDays(today, 370)) {
+    throw new Error("目标日期超过脚本允许的范围（370 天）");
+  }
+  if (options.notBefore && mode !== "submit") {
+    throw new Error("--not-before 只允许用于 --submit");
+  }
+  const maxLatenessMs = options.maxLatenessMs ?? 120_000;
+  if (options.notBefore && Date.now() > options.notBefore.getTime() + maxLatenessMs) {
+    throw new Error(`已错过预约执行窗口：${options.notBefore.toISOString()}`);
+  }
+
+  const artifacts = await artifactPaths(plan.id);
+  let normalEdgeStarted = false;
+  let launchRequests = 0;
+  let selectedSlot: string | undefined;
+  let screenshot: string | undefined;
+  try {
+    normalEdgeStarted = true;
+    await openAuthenticatedReservationPage();
+    await moveToTargetWeek(plan.targetDate);
+    if (options.notBefore) {
+      console.log(
+        `[${new Date().toISOString()}] RUN_PHASE：页面预热完成，等待 ${options.notBefore.toISOString()}`,
+      );
+      await waitUntilRelease(options.notBefore, maxLatenessMs);
+      console.log(`[${new Date().toISOString()}] RUN_PHASE：开放时刻已到，刷新预约资源`);
+      await reloadReservationTable();
+      await moveToTargetWeek(plan.targetDate);
+    }
+    await installLaunchMonitor();
+    console.log(`[${new Date().toISOString()}] RUN_PHASE：按优先级选择目标时段`);
+    const selection = await selectSlot(plan.targetDate, plan.slots);
+    selectedSlot = selection.slot;
+    await focusCourtTab();
+    if (mode === "dry-run") {
+      await captureCourtWindow(artifacts.screenshotPath);
+      screenshot = artifacts.screenshotPath;
+    } else {
+      try {
+        await captureCourtWindow(artifacts.screenshotPath);
+        screenshot = artifacts.screenshotPath;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `[${new Date().toISOString()}] RUN_WARNING：锁屏状态无法截图，继续实订：${detail}`,
+        );
+      }
+    }
+
+    if (mode === "dry-run") {
+      launchRequests = await countLaunchRequests();
+      if (launchRequests !== 0) {
+        throw new Error("dry-run 检测到预约提交请求，已停止");
+      }
+      const result: ReservationResult = {
+        mode,
+        planId: plan.id,
+        targetDate: plan.targetDate,
+        selectedSlot,
+        status: "ready",
+        message: `READY_TO_SUBMIT：${plan.targetDate} ${selectedSlot}（${selection.availability}）`,
+        launchRequests,
+        screenshot,
+      };
+      await executeCourtJavaScript("location.reload(); JSON.stringify({cleared: true})");
+      await writeResultLog(artifacts.logPath, result);
+      await updatePlan(
+        plan.id,
+        "ready",
+        { at: new Date().toISOString(), mode, slot: selectedSlot, result: "ready" },
+        result,
+      );
+      return result;
+    }
+
+    if (await captchaVisible()) {
+      throw new Error("页面出现验证码或滑块，脚本不会尝试绕过");
+    }
+    console.log(`[${new Date().toISOString()}] RUN_PHASE：二次核验通过，单次点击确认预约`);
+    await submitReservation();
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    launchRequests = await countLaunchRequests();
+    if (launchRequests > 1) {
+      throw new Error(`预约提交请求次数异常：${launchRequests}`);
+    }
+
+    const recordFound = await verifyAppointment(plan.targetDate, selectedSlot);
+    const status = recordFound ? "confirmed" : "ambiguous";
+    const result: ReservationResult = {
+      mode,
+      planId: plan.id,
+      targetDate: plan.targetDate,
+      selectedSlot,
+      status,
+      message: recordFound
+        ? `预约成功：${plan.targetDate} ${selectedSlot}`
+        : "提交已发出，但未在我的预约中确认，禁止自动重试",
+      launchRequests,
+      screenshot,
+    };
+    await writeResultLog(artifacts.logPath, result);
+    await updatePlan(
+      plan.id,
+      status,
+      { at: new Date().toISOString(), mode, slot: selectedSlot, result: status },
+      result,
+    );
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const result: ReservationResult = {
+      mode,
+      planId: plan.id,
+      targetDate: plan.targetDate,
+      selectedSlot,
+      status: "failed",
+      message,
+      launchRequests,
+    };
+    await writeResultLog(artifacts.logPath, result).catch(() => undefined);
+    await updatePlan(
+      plan.id,
+      "failed",
+      {
+        at: new Date().toISOString(),
+        mode,
+        slot: selectedSlot,
+        result: "failed",
+        message: message.slice(0, 300),
+      },
+      result,
+    ).catch(() => undefined);
+    throw error;
+  } finally {
+    if (normalEdgeStarted) {
+      await closeCourtWindow().catch(() => undefined);
+      await stopDedicatedEdge().catch(() => undefined);
+    }
+  }
+}
