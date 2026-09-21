@@ -38,6 +38,14 @@ courtscript plan add-priority --date 2026-09-23 \
   --high-slot 20:00-21:00 --low-slot 08:00-09:00
 ```
 
+两个优先级也可以使用不同日期：
+
+```bash
+courtscript plan add-priority \
+  --high-date 2026-09-23 --high-slot 08:00-09:00 \
+  --low-date 2026-09-22 --low-slot 08:00-09:00
+```
+
 这与普通计划的 `--fallback` 不同：`--fallback` 最多成功预约一个时段；串行优先级计划会先独立提交高优先级时段，高优先级成功或失败后，再从 eHall 重新开始并独立提交低优先级时段。
 
 ## 运行

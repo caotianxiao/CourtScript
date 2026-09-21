@@ -67,6 +67,8 @@ export interface PriorityPairResult {
 export interface PriorityPair {
   id: string;
   targetDate: string;
+  highDate: string;
+  lowDate: string;
   highSlot: string;
   lowSlot: string;
   highPlanId: string;

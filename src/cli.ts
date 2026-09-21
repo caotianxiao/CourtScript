@@ -92,17 +92,27 @@ plan
 plan
   .command("add-priority")
   .description("创建先高后低、分别提交的两个串行时段")
-  .requiredOption("--date <YYYY-MM-DD>", "预约日期")
+  .option("--date <YYYY-MM-DD>", "两个时段使用同一预约日期")
+  .option("--high-date <YYYY-MM-DD>", "高优先级预约日期")
+  .option("--low-date <YYYY-MM-DD>", "低优先级预约日期")
   .requiredOption("--high-slot <HH:mm-HH:mm>", "高优先级时段")
   .requiredOption("--low-slot <HH:mm-HH:mm>", "低优先级时段")
   .action(async (options: {
     date: string;
+    highDate?: string;
+    lowDate?: string;
     highSlot: string;
     lowSlot: string;
   }) => {
+    const highDate = options.highDate ?? options.date;
+    const lowDate = options.lowDate ?? options.date;
+    if (!highDate || !lowDate) {
+      throw new Error("必须指定 --date，或同时指定 --high-date 和 --low-date");
+    }
     const created = await addPriorityPair(
-      options.date,
+      highDate,
       options.highSlot,
+      lowDate,
       options.lowSlot,
     );
     console.log(JSON.stringify(created, null, 2));
@@ -136,9 +146,8 @@ plan
       console.table(
         store.priorityPairs.map((item) => ({
           id: item.id,
-          date: item.targetDate,
-          high: item.highSlot,
-          low: item.lowSlot,
+          high: `${item.highDate} ${item.highSlot}`,
+          low: `${item.lowDate} ${item.lowSlot}`,
           status: item.status,
         })),
       );
@@ -192,10 +201,10 @@ program
     if (!Number.isInteger(prepareMinutes)) {
       throw new Error("--prepare-minutes 必须是整数");
     }
-    const releaseDate = releaseDateFor(selectedPair.targetDate);
+    const releaseDate = releaseDateFor(selectedPair.highDate);
     if (shanghaiDate(at) !== releaseDate) {
       throw new Error(
-        `目标日期 ${selectedPair.targetDate} 应在 ${releaseDate} 抢订，调度日期不匹配`,
+        `高优先级日期 ${selectedPair.highDate} 应在 ${releaseDate} 抢订，调度日期不匹配`,
       );
     }
     const scheduled = await installPrioritySchedule(

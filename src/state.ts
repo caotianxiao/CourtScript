@@ -32,6 +32,10 @@ export async function loadStore(): Promise<PlanStore> {
     if (!Array.isArray(parsed.priorityPairs)) {
       throw new Error("优先级计划文件格式不受支持");
     }
+    for (const pair of parsed.priorityPairs) {
+      pair.highDate ??= pair.targetDate;
+      pair.lowDate ??= pair.targetDate;
+    }
     return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -75,15 +79,17 @@ export async function addPlan(
 }
 
 export async function addPriorityPair(
-  targetDate: string,
+  highDate: string,
   highSlot: string,
+  lowDate: string,
   lowSlot: string,
 ): Promise<PriorityPair> {
-  validateDate(targetDate);
+  validateDate(highDate);
+  validateDate(lowDate);
   validateSlot(highSlot);
   validateSlot(lowSlot);
-  if (highSlot === lowSlot) {
-    throw new Error("高、低优先级时段不能相同");
+  if (highDate === lowDate && highSlot === lowSlot) {
+    throw new Error("高、低优先级的日期和时段不能完全相同");
   }
 
   const store = await loadStore();
@@ -91,7 +97,7 @@ export async function addPriorityPair(
   const highPlan: ReservationPlan = {
     id: randomUUID().slice(0, 8),
     resourceId: RESOURCE_ID,
-    targetDate,
+    targetDate: highDate,
     slots: [highSlot],
     status: "pending",
     createdAt: now,
@@ -101,7 +107,7 @@ export async function addPriorityPair(
   const lowPlan: ReservationPlan = {
     id: randomUUID().slice(0, 8),
     resourceId: RESOURCE_ID,
-    targetDate,
+    targetDate: lowDate,
     slots: [lowSlot],
     status: "pending",
     createdAt: now,
@@ -110,7 +116,9 @@ export async function addPriorityPair(
   };
   const pair: PriorityPair = {
     id: randomUUID().slice(0, 8),
-    targetDate,
+    targetDate: highDate,
+    highDate,
+    lowDate,
     highSlot,
     lowSlot,
     highPlanId: highPlan.id,

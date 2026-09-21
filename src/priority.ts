@@ -105,19 +105,19 @@ export async function runPriorityPair(
 ): Promise<PriorityPairResult> {
   await updatePriorityPair(pair.id, "running");
   console.log(
-    `[${new Date().toISOString()}] PRIORITY_PHASE：开始高优先级 ${pair.highSlot}`,
+    `[${new Date().toISOString()}] PRIORITY_PHASE：开始高优先级 ${pair.highDate} ${pair.highSlot}`,
   );
   const high = await runChild(pair.highPlanId, mode, options);
 
   console.log(
-    `[${new Date().toISOString()}] PRIORITY_PHASE：高优先级结束（${high.status}），立即从 eHall 开始低优先级 ${pair.lowSlot}`,
+    `[${new Date().toISOString()}] PRIORITY_PHASE：高优先级结束（${high.status}），立即从 eHall 开始低优先级 ${pair.lowDate} ${pair.lowSlot}`,
   );
   const low = await runChild(pair.lowPlanId, mode, {});
   const status = priorityResultStatus(high, low, mode);
   const message = [
     `优先级计划 ${pair.id}：${status}`,
-    `高 ${pair.highSlot}=${high.status}`,
-    `低 ${pair.lowSlot}=${low.status}`,
+    `高 ${pair.highDate} ${pair.highSlot}=${high.status}`,
+    `低 ${pair.lowDate} ${pair.lowSlot}=${low.status}`,
   ].join("；");
   const result: PriorityPairResult = {
     mode,
