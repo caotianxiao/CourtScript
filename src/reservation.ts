@@ -78,22 +78,67 @@ export async function reloadReservationTable(): Promise<void> {
   );
 }
 
-async function displayedRange(): Promise<[string, string]> {
-  const output = await executeCourtJavaScript(`(() => {
-    const start = document.querySelector('input[placeholder="开始日期"]');
-    const end = document.querySelector('input[placeholder="结束日期"]');
-    return JSON.stringify([start ? start.value : '', end ? end.value : '']);
-  })()`);
-  return JSON.parse(output) as [string, string];
+interface WeekNavigationSnapshot {
+  start: string;
+  end: string;
+  visibleDates: string[];
 }
+
+export type WeekNavigationDecision = "visible" | "wait" | "前一周" | "后一周";
+
+export function decideWeekNavigation(
+  targetDate: string,
+  snapshot: WeekNavigationSnapshot,
+): WeekNavigationDecision {
+  // The rendered date columns are the authoritative state.  In particular,
+  // they can be ready before the date-range inputs finish hydrating after a
+  // reload, so a visible target must never trigger week navigation.
+  if (snapshot.visibleDates.includes(targetDate)) {
+    return "visible";
+  }
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  if (
+    !datePattern.test(snapshot.start)
+    || !datePattern.test(snapshot.end)
+    || snapshot.start > snapshot.end
+  ) {
+    return "wait";
+  }
+  // If the inputs say that the target belongs to this week but its column is
+  // not rendered yet, keep waiting instead of clicking a navigation control.
+  if (targetDate >= snapshot.start && targetDate <= snapshot.end) {
+    return "wait";
+  }
+  return targetDate < snapshot.start ? "前一周" : "后一周";
+}
+
+const WEEK_NAVIGATION_STATE_SCRIPT = `(() => {
+  const start = document.querySelector('input[placeholder="开始日期"]');
+  const end = document.querySelector('input[placeholder="结束日期"]');
+  const visibleDates = Array.from(
+    document.querySelectorAll('.reservation_data .week_header span'),
+  ).map((item) => item.innerText.trim())
+    .filter((text) => /^\\d{4}-\\d{2}-\\d{2}$/.test(text));
+  return JSON.stringify({
+    start: start ? start.value.trim() : '',
+    end: end ? end.value.trim() : '',
+    visibleDates,
+  });
+})()`;
 
 async function moveToTargetWeek(targetDate: string): Promise<void> {
   for (let step = 0; step < 110; step += 1) {
-    const [start, end] = await displayedRange();
-    if (targetDate >= start && targetDate <= end) {
+    const snapshot = await waitForCourtJavaScript<WeekNavigationSnapshot>(
+      WEEK_NAVIGATION_STATE_SCRIPT,
+      (value) => decideWeekNavigation(targetDate, value) !== "wait",
+      PAGE_TIMEOUT,
+      `等待目标日期列 ${targetDate}`,
+    );
+    const decision = decideWeekNavigation(targetDate, snapshot);
+    if (decision === "visible") {
       return;
     }
-    const label = targetDate < start ? "前一周" : "后一周";
+    const label = decision;
     const result = JSON.parse(await executeCourtJavaScript(`(() => {
       const label = ${JSON.stringify(label)};
       const candidates = Array.from(document.querySelectorAll('button,a,span,div'))
@@ -107,11 +152,12 @@ async function moveToTargetWeek(targetDate: string): Promise<void> {
     if (!result.clicked) {
       throw new Error(`页面缺少“${label}”控件`);
     }
-    await waitForCourtJavaScript<{ start: string }>(
-      `(() => JSON.stringify({
-        start: document.querySelector('input[placeholder="开始日期"]')?.value || ''
-      }))()`,
-      (value) => value.start !== start,
+    const previousDates = snapshot.visibleDates.join(",");
+    await waitForCourtJavaScript<WeekNavigationSnapshot>(
+      WEEK_NAVIGATION_STATE_SCRIPT,
+      (value) => value.start !== snapshot.start
+        || value.end !== snapshot.end
+        || value.visibleDates.join(",") !== previousDates,
       PAGE_TIMEOUT,
       `切换${label}`,
     );
