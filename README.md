@@ -105,3 +105,17 @@ courtscript schedule-priority --pair <id> \
 主流程从 `ehall.fudan.edu.cn` 开始，全程使用独立 profile 的普通 Microsoft Edge，并通过 Edge 内置的 Apple Events JavaScript 接口完成页面读取和点击。这样既避免预约站在 WebDriver 下出现空白页，也避免 eHall 登录按钮在 WebDriver 中失效。脚本只在 `id.fudan.edu.cn` 登录表单中填入保存的凭据；遇到验证码或滑块会停止，不会尝试绕过。
 
 独立 profile、凭据元数据、计划、日志和截图全部位于 `.state/`，该目录不会进入 Git。
+
+## 双 Edge 并发实验
+
+实验分支提供一个只选择、不提交的双进程验证命令：
+
+```bash
+courtscript parallel-feasibility --date 2026-09-24 \
+  --slot-a 08:00-09:00 --slot-b 09:00-10:00
+```
+
+命令会创建两套临时隔离 profile、启动两个普通 Edge 根进程、同时刷新并分别选中
+两个时段，要求两边的预约提交请求数均为零，然后关闭进程并删除临时 profile。
+实测结论和正式并发版本的约束见
+[`docs/parallel-first-priority-feasibility.md`](docs/parallel-first-priority-feasibility.md)。

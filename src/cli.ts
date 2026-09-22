@@ -20,6 +20,7 @@ import {
 } from "./scheduler.js";
 import type { RunMode } from "./types.js";
 import { releaseDateFor, shanghaiDate } from "./validation.js";
+import { runParallelFeasibility } from "./parallel-feasibility.js";
 
 function parseTimestamp(value: string, optionName: string): Date {
   if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
@@ -152,6 +153,21 @@ plan
         })),
       );
     }
+  });
+
+program
+  .command("parallel-feasibility")
+  .description("用两个隔离 Edge profile 并发验证两个时段，不提交预约")
+  .requiredOption("--date <YYYY-MM-DD>", "验证日期")
+  .requiredOption("--slot-a <HH:mm-HH:mm>", "Edge A 的时段")
+  .requiredOption("--slot-b <HH:mm-HH:mm>", "Edge B 的时段")
+  .action(async (options: { date: string; slotA: string; slotB: string }) => {
+    const result = await runParallelFeasibility({
+      targetDate: options.date,
+      slots: [options.slotA, options.slotB],
+    });
+    console.log("PARALLEL_FEASIBLE：两个独立 Edge 已同时选中不同时段，未提交");
+    console.log(JSON.stringify(result, null, 2));
   });
 
 program
