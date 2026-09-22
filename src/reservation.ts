@@ -170,24 +170,50 @@ interface SlotSelection {
   availability: string;
 }
 
-async function selectSlot(
-  targetDate: string,
-  slots: string[],
-): Promise<SlotSelection> {
-  const result = await waitForCourtJavaScript<SlotSelection & {
-    state: "loading" | "selected" | "unavailable" | "error";
-    error?: string;
-    timeCount?: number;
-    cellCount?: number;
-  }>(`(() => {
+interface SlotUiState {
+  state: "loading" | "candidate" | "unavailable" | "error";
+  slot?: string;
+  availability?: string;
+  summary: boolean;
+  phone: boolean;
+  active: boolean;
+  error?: string;
+  timeCount?: number;
+  cellCount?: number;
+}
+
+export type SelectionAction = "confirmed" | "wait" | "click";
+
+export function decideSelectionAction(
+  state: Pick<SlotUiState, "summary" | "phone" | "active">,
+): SelectionAction {
+  if (state.summary && state.phone) {
+    return "confirmed";
+  }
+  // An active cell or an existing summary means the first click did take
+  // effect. Never click it again because the site's handler toggles it off.
+  if (state.active || state.summary) {
+    return "wait";
+  }
+  return "click";
+}
+
+function slotUiStateScript(targetDate: string, slots: string[]): string {
+  return `(() => {
     const targetDate = ${JSON.stringify(targetDate)};
     const slots = ${JSON.stringify(slots)};
+    const empty = (extra) => ({
+      summary: false,
+      phone: false,
+      active: false,
+      ...extra,
+    });
     const times = Array.from(
       document.querySelectorAll('.left_time dd.resource_item_info'),
     ).map((item) => item.innerText.trim());
     if (times.length !== 14
         || times.some((time) => !/^\\d{2}:\\d{2}-\\d{2}:\\d{2}$/.test(time))) {
-      return JSON.stringify({state: 'loading', timeCount: times.length});
+      return JSON.stringify(empty({state: 'loading', timeCount: times.length}));
     }
     const columns = Array.from(document.querySelectorAll('.reservation_data'));
     const matches = columns.filter((column) =>
@@ -195,61 +221,206 @@ async function selectSlot(
         .some((span) => span.innerText.trim() === targetDate),
     );
     if (matches.length === 0) {
-      return JSON.stringify({state: 'loading', timeCount: times.length});
+      return JSON.stringify(empty({state: 'loading', timeCount: times.length}));
     }
     if (matches.length > 1) {
-      return JSON.stringify({
+      return JSON.stringify(empty({
         state: 'error',
         error: '无法唯一定位日期列：' + targetDate,
-      });
+      }));
     }
     const cells = Array.from(matches[0].querySelectorAll('dd.resource_item_info'));
     if (cells.length !== 14 || cells.some((cell) => cell.innerText.trim().length === 0)) {
-      return JSON.stringify({
+      return JSON.stringify(empty({
         state: 'loading',
         timeCount: times.length,
         cellCount: cells.length,
-      });
+      }));
     }
-    for (const slot of slots) {
-      const index = times.indexOf(slot);
-      const cell = index >= 0 ? cells[index] : undefined;
-      if (!cell) continue;
-      const text = cell.innerText.trim();
-      if (!text.includes('可预约') || !cell.classList.contains('can_active')) continue;
-      cell.scrollIntoView({block: 'center'});
-      cell.click();
-      return JSON.stringify({state: 'selected', slot, availability: text});
-    }
-    return JSON.stringify({
-      state: 'unavailable',
-      error: '首选和备选时段均不可预约：' + slots.join(', '),
-    });
-  })()`,
-  (value) => value.state !== "loading",
-  PAGE_TIMEOUT,
-  "等待完整预约表格",
-  );
-  if (result.error) {
-    throw new Error(result.error);
-  }
-  if (result.state !== "selected" || !result.slot || !result.availability) {
-    throw new Error("预约表格返回了无法识别的选择状态");
-  }
-  await waitForCourtJavaScript<{ summary: boolean; phone: boolean }>(
-    `(() => {
-      const expected = ${JSON.stringify(`${targetDate} ${result.slot}`)};
-      const summary = Array.from(document.querySelectorAll('*'))
+    const phoneInput = document.querySelector('input[placeholder="请输入手机号"]');
+    const phone = Boolean(phoneInput && phoneInput.value.trim());
+    const hasSummary = (slot) => {
+      const expected = targetDate + ' ' + slot;
+      return Array.from(document.querySelectorAll('*'))
         .some((item) => typeof item.innerText === 'string'
           && item.innerText.trim().replace(/\\s+/g, ' ') === expected);
-      const phone = document.querySelector('input[placeholder="请输入手机号"]');
-      return JSON.stringify({summary, phone: Boolean(phone && phone.value.trim())});
-    })()`,
-    (value) => value.summary && value.phone,
-    PAGE_TIMEOUT,
-    "核验预约日期、时段和预填手机号",
+    };
+    const details = (slot) => {
+      const index = times.indexOf(slot);
+      const cell = index >= 0 ? cells[index] : undefined;
+      return {
+        cell,
+        text: cell ? cell.innerText.trim() : '',
+        summary: hasSummary(slot),
+        active: Boolean(cell && cell.classList.contains('active')),
+      };
+    };
+    // Preserve an existing selection even if a later table update changed the
+    // cell's availability class.
+    for (const slot of slots) {
+      const detail = details(slot);
+      if (detail.summary || detail.active) {
+        return JSON.stringify({
+          state: 'candidate',
+          slot,
+          availability: detail.text,
+          summary: detail.summary,
+          phone,
+          active: detail.active,
+        });
+      }
+    }
+    for (const slot of slots) {
+      const detail = details(slot);
+      if (!detail.cell) continue;
+      if (!detail.text.includes('可预约')
+          || !detail.cell.classList.contains('can_active')) continue;
+      return JSON.stringify({
+        state: 'candidate',
+        slot,
+        availability: detail.text,
+        summary: false,
+        phone,
+        active: false,
+      });
+    }
+    return JSON.stringify(empty({
+      state: 'unavailable',
+      error: '首选和备选时段均不可预约：' + slots.join(', '),
+    }));
+  })()`;
+}
+
+async function readSlotUiState(
+  targetDate: string,
+  slots: string[],
+  timeoutMs = PAGE_TIMEOUT,
+): Promise<SlotUiState> {
+  return waitForCourtJavaScript<SlotUiState>(
+    slotUiStateScript(targetDate, slots),
+    (value) => value.state !== "loading",
+    timeoutMs,
+    "等待完整预约表格",
   );
-  return { slot: result.slot, availability: result.availability };
+}
+
+async function clickLatestSlotCell(
+  targetDate: string,
+  slot: string,
+): Promise<"clicked" | "pending" | "confirmed" | "unavailable"> {
+  const output = await executeCourtJavaScript(`(() => {
+    const targetDate = ${JSON.stringify(targetDate)};
+    const slot = ${JSON.stringify(slot)};
+    const expected = targetDate + ' ' + slot;
+    const summary = Array.from(document.querySelectorAll('*'))
+      .some((item) => typeof item.innerText === 'string'
+        && item.innerText.trim().replace(/\\s+/g, ' ') === expected);
+    const phoneInput = document.querySelector('input[placeholder="请输入手机号"]');
+    const phone = Boolean(phoneInput && phoneInput.value.trim());
+    if (summary && phone) return JSON.stringify({state: 'confirmed'});
+    const times = Array.from(
+      document.querySelectorAll('.left_time dd.resource_item_info'),
+    ).map((item) => item.innerText.trim());
+    const column = Array.from(document.querySelectorAll('.reservation_data'))
+      .find((item) => Array.from(item.querySelectorAll('.week_header span'))
+        .some((span) => span.innerText.trim() === targetDate));
+    const index = times.indexOf(slot);
+    const cell = column && index >= 0
+      ? column.querySelectorAll('dd.resource_item_info')[index]
+      : undefined;
+    if (!cell) return JSON.stringify({state: 'unavailable'});
+    if (summary || cell.classList.contains('active')) {
+      return JSON.stringify({state: 'pending'});
+    }
+    const text = cell.innerText.trim();
+    if (!text.includes('可预约') || !cell.classList.contains('can_active')) {
+      return JSON.stringify({state: 'unavailable'});
+    }
+    cell.scrollIntoView({block: 'center'});
+    cell.click();
+    return JSON.stringify({state: 'clicked'});
+  })()`);
+  const result = JSON.parse(output) as {
+    state?: "clicked" | "pending" | "confirmed" | "unavailable";
+  };
+  return result.state ?? "unavailable";
+}
+
+async function waitForSelectionConfirmation(
+  targetDate: string,
+  slot: string,
+  timeoutMs: number,
+): Promise<SlotUiState | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  let lastState: SlotUiState | undefined;
+  while (Date.now() < deadline) {
+    try {
+      lastState = await readSlotUiState(targetDate, [slot], 300);
+      if (decideSelectionAction(lastState) === "confirmed") {
+        return lastState;
+      }
+    } catch {
+      // A table replacement can make the DOM briefly incomplete. The next
+      // retry will locate the newest cell node.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 75));
+  }
+  return undefined;
+}
+
+export async function selectSlot(
+  targetDate: string,
+  slots: string[],
+): Promise<SlotSelection> {
+  const maxAttempts = 4;
+  const confirmationTimeoutMs = 600;
+  let lastState: SlotUiState | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const state = await readSlotUiState(targetDate, slots);
+    lastState = state;
+    if (state.error) {
+      throw new Error(state.error);
+    }
+    if (state.state === "unavailable") {
+      throw new Error(state.error ?? `目标时段不可预约：${slots.join(", ")}`);
+    }
+    if (!state.slot) {
+      throw new Error("预约表格返回了无法识别的选择状态");
+    }
+    if (decideSelectionAction(state) === "confirmed") {
+      return { slot: state.slot, availability: state.availability ?? "可预约" };
+    }
+    if (decideSelectionAction(state) === "click") {
+      const clickResult = await clickLatestSlotCell(targetDate, state.slot);
+      if (clickResult === "confirmed") {
+        return { slot: state.slot, availability: state.availability ?? "可预约" };
+      }
+    }
+    const confirmed = await waitForSelectionConfirmation(
+      targetDate,
+      state.slot,
+      confirmationTimeoutMs,
+    );
+    if (confirmed) {
+      return {
+        slot: state.slot,
+        availability: confirmed.availability || state.availability || "可预约",
+      };
+    }
+    if (attempt < maxAttempts) {
+      console.log(
+        `[${new Date().toISOString()}] RUN_PHASE：时段选择未确认，重新定位并重试（${attempt + 1}/${maxAttempts}）`,
+      );
+    }
+  }
+  throw new Error(
+    `时段选择经 ${maxAttempts} 次尝试仍未被页面确认：${JSON.stringify({
+      slot: lastState?.slot,
+      summary: lastState?.summary,
+      phone: lastState?.phone,
+      active: lastState?.active,
+    })}`,
+  );
 }
 
 async function installLaunchMonitor(): Promise<void> {
@@ -323,15 +494,27 @@ async function captchaVisible(): Promise<boolean> {
   return Boolean((JSON.parse(output) as { challenge?: boolean }).challenge);
 }
 
-async function submitReservation(): Promise<void> {
+async function submitReservation(targetDate: string, slot: string): Promise<void> {
   const output = await executeCourtJavaScript(`(() => {
+    const expected = ${JSON.stringify(`${targetDate} ${slot}`)};
+    const summary = Array.from(document.querySelectorAll('*'))
+      .some((item) => typeof item.innerText === 'string'
+        && item.innerText.trim().replace(/\\s+/g, ' ') === expected);
+    const phoneInput = document.querySelector('input[placeholder="请输入手机号"]');
+    if (!summary || !phoneInput || !phoneInput.value.trim()) {
+      return JSON.stringify({clicked: false, reason: 'selection-missing'});
+    }
     const button = Array.from(document.querySelectorAll('button'))
       .find((item) => item.innerText.trim() === '确认预约');
-    if (!button) return JSON.stringify({clicked: false});
+    if (!button) return JSON.stringify({clicked: false, reason: 'button-missing'});
     button.click();
     return JSON.stringify({clicked: true});
   })()`);
-  if (!(JSON.parse(output) as { clicked?: boolean }).clicked) {
+  const result = JSON.parse(output) as { clicked?: boolean; reason?: string };
+  if (!result.clicked && result.reason === "selection-missing") {
+    throw new Error("提交前预约日期、时段或手机号状态已失效");
+  }
+  if (!result.clicked) {
     throw new Error("页面缺少“确认预约”按钮");
   }
 }
@@ -449,7 +632,7 @@ export async function runReservation(
       throw new Error("页面出现验证码或滑块，脚本不会尝试绕过");
     }
     console.log(`[${new Date().toISOString()}] RUN_PHASE：二次核验通过，单次点击确认预约`);
-    await submitReservation();
+    await submitReservation(plan.targetDate, selectedSlot);
     if (options.deferVerification) {
       // Give the page's click handler enough time to dispatch its request, but
       // do not block the next priority on screenshots or My Reservation.
