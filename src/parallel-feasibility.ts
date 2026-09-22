@@ -1,10 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdir, rm } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, cp, mkdir, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import {
   EDGE_EXECUTABLE,
   LAUNCH_PATH,
+  PROFILE_DIR,
   RESERVATION_URL,
   STATE_DIR,
 } from "./constants.js";
@@ -181,6 +183,7 @@ interface BrowserProbe {
   selectionMs: number;
   launchRequests: number;
   launchResponseStatuses: number[];
+  launchResponseBodies: string[];
 }
 
 export interface ParallelFeasibilityResult {
@@ -193,6 +196,7 @@ export interface ParallelFeasibilityResult {
   distinctRootProcesses: boolean;
   distinctProfiles: boolean;
   refreshStartSkewMs: number;
+  requestedSubmitDelayMs?: number;
   submitStartSkewMs?: number;
   simultaneousSelectionsHeld: boolean;
   recordsFound?: [boolean, boolean];
@@ -487,7 +491,7 @@ async function selectWithoutSubmitting(
 ): Promise<{ availability: string; selectionMs: number }> {
   const started = Date.now();
   let availability = "";
-  for (let attempt = 0; attempt < 4; attempt += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     const state = await page.evaluate(({ targetDate, slot }) => {
       const expected = `${targetDate} ${slot}`;
       const summary = Array.from(document.querySelectorAll<HTMLElement>("*"))
@@ -508,7 +512,7 @@ async function selectWithoutSubmitting(
       const cell = column && index >= 0
         ? column.querySelectorAll<HTMLElement>("dd.resource_item_info")[index]
         : undefined;
-      if (!cell) return { status: "unavailable" as const };
+      if (!cell) return { status: "transient" as const };
       const text = cell.innerText.trim();
       if (summary || cell.classList.contains("active")) {
         return { status: "pending" as const, availability: text };
@@ -521,6 +525,10 @@ async function selectWithoutSubmitting(
       return { status: "clicked" as const, availability: text };
     }, { targetDate, slot });
     availability = state.availability ?? availability;
+    if (state.status === "transient") {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      continue;
+    }
     if (state.status === "confirmed") {
       return { availability: availability || "可预约", selectionMs: Date.now() - started };
     }
@@ -544,7 +552,7 @@ async function selectWithoutSubmitting(
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
-  throw new Error(`${targetDate} ${slot} 经 4 次尝试仍未选中`);
+  throw new Error(`${targetDate} ${slot} 经 8 次尝试仍未选中`);
 }
 
 async function submitExactSelection(
@@ -668,6 +676,8 @@ export async function runParallelFeasibility(options: {
   targetDate: string;
   slots: [string, string];
   submit?: boolean;
+  submitDelayMs?: number;
+  seedProfile?: boolean;
 }): Promise<ParallelFeasibilityResult> {
   const targetDate = validateDate(options.targetDate);
   const requestedSlots: [string, string] = [
@@ -677,6 +687,13 @@ export async function runParallelFeasibility(options: {
   if (requestedSlots[0] === requestedSlots[1]) {
     throw new Error("并发验证必须使用两个不同时段");
   }
+  const submitDelayMs = options.submitDelayMs ?? 0;
+  if (!Number.isInteger(submitDelayMs) || submitDelayMs < 0 || submitDelayMs > 10_000) {
+    throw new Error("提交错峰必须是 0–10000 毫秒的整数");
+  }
+  if (!options.submit && submitDelayMs !== 0) {
+    throw new Error("只有真实提交模式允许设置提交错峰");
+  }
   const credentials = await loadStoredCredentials();
   if (!credentials) throw new Error("并发验证需要已保存的统一身份认证凭据");
 
@@ -685,6 +702,21 @@ export async function runParallelFeasibility(options: {
   await chmod(EXPERIMENT_ROOT, 0o700);
   const profileA = join(EXPERIMENT_ROOT, "profile-a");
   const profileB = join(EXPERIMENT_ROOT, "profile-b");
+  if (options.seedProfile) {
+    console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：复制已验证的专用登录 profile`);
+    await Promise.all([profileA, profileB].map(async (profileDir) => {
+      await cp(PROFILE_DIR, profileDir, {
+        recursive: true,
+        mode: fsConstants.COPYFILE_FICLONE,
+      });
+      await Promise.all([
+        "SingletonCookie",
+        "SingletonLock",
+        "SingletonSocket",
+      ].map((name) => rm(join(profileDir, name), { force: true })));
+      await chmod(profileDir, 0o700);
+    }));
+  }
   const portA = await freeLocalPort();
   let portB = await freeLocalPort();
   while (portB === portA) portB = await freeLocalPort();
@@ -727,6 +759,8 @@ export async function runParallelFeasibility(options: {
 
     const requestCounts = [0, 0];
     const responseStatuses: [number[], number[]] = [[], []];
+    const responseBodies: [string[], string[]] = [[], []];
+    const launchRequestIds: [Set<string>, Set<string>] = [new Set(), new Set()];
     await Promise.all([browserA, browserB].map(async (instance, index) => {
       instance.cdp.on("Network.requestWillBeSent", (params) => {
         const url = (params as { request?: { url?: string } }).request?.url;
@@ -740,17 +774,34 @@ export async function runParallelFeasibility(options: {
         }
       });
       instance.cdp.on("Network.responseReceived", (params) => {
-        const response = (params as {
+        const event = params as {
+          requestId?: string;
           response?: { url?: string; status?: number };
-        }).response;
+        };
+        const response = event.response;
         if (!response?.url) return;
         try {
           if (new URL(response.url).pathname === LAUNCH_PATH) {
             responseStatuses[index]?.push(Number(response.status) || 0);
+            if (event.requestId) launchRequestIds[index]?.add(event.requestId);
           }
         } catch {
           // Ignore malformed non-HTTP response URLs.
         }
+      });
+      instance.cdp.on("Network.loadingFinished", (params) => {
+        const requestId = (params as { requestId?: string }).requestId;
+        if (!requestId || !launchRequestIds[index]?.has(requestId)) return;
+        launchRequestIds[index]?.delete(requestId);
+        void instance.cdp.send<{ body?: string; base64Encoded?: boolean }>(
+          "Network.getResponseBody",
+          { requestId },
+        ).then((response) => {
+          const body = response.base64Encoded && response.body
+            ? Buffer.from(response.body, "base64").toString("utf8")
+            : (response.body ?? "");
+          responseBodies[index]?.push(body.slice(0, 2_000));
+        }).catch(() => undefined);
       });
       await instance.cdp.send("Network.enable");
     }));
@@ -787,10 +838,17 @@ export async function runParallelFeasibility(options: {
     let submitStartSkewMs: number | undefined;
     let recordsFound: [boolean, boolean] | undefined;
     if (options.submit) {
-      console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：双路各单次点击确认预约`);
+      console.log(
+        `[${new Date().toISOString()}] PARALLEL_PHASE：双路各单次点击确认预约（B 延迟 ${submitDelayMs}ms）`,
+      );
       const submitStarts = await Promise.all([
         submitExactSelection(browserA.page, targetDate, testedSlots[0]),
-        submitExactSelection(browserB.page, targetDate, testedSlots[1]),
+        (async () => {
+          if (submitDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
+          }
+          return submitExactSelection(browserB.page, targetDate, testedSlots[1]);
+        })(),
       ]);
       submitStartSkewMs = Math.abs(submitStarts[0] - submitStarts[1]);
       await new Promise((resolve) => setTimeout(resolve, 2_500));
@@ -822,6 +880,7 @@ export async function runParallelFeasibility(options: {
         selectionMs: selections[index]?.selectionMs ?? 0,
         launchRequests: requestCounts[index] ?? 0,
         launchResponseStatuses: responseStatuses[index] ?? [],
+        launchResponseBodies: responseBodies[index] ?? [],
       }),
     ) as [BrowserProbe, BrowserProbe];
     return {
@@ -838,6 +897,7 @@ export async function runParallelFeasibility(options: {
         && probes[0].rootPid !== probes[1].rootPid,
       distinctProfiles: profileA !== profileB,
       refreshStartSkewMs: Math.abs((refreshStarts[0] ?? 0) - (refreshStarts[1] ?? 0)),
+      requestedSubmitDelayMs: options.submit ? submitDelayMs : undefined,
       submitStartSkewMs,
       simultaneousSelectionsHeld,
       recordsFound,

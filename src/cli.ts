@@ -162,16 +162,23 @@ program
   .requiredOption("--slot-a <HH:mm-HH:mm>", "Edge A 的时段")
   .requiredOption("--slot-b <HH:mm-HH:mm>", "Edge B 的时段")
   .option("--submit", "两个 Edge 各单次真实提交精确目标时段")
+  .option("--submit-delay-ms <milliseconds>", "B 相对 A 的提交延迟", "0")
+  .option("--seed-profile", "从已验证的 CourtScript 专用 profile 创建两份临时副本")
   .action(async (options: {
     date: string;
     slotA: string;
     slotB: string;
     submit?: boolean;
+    submitDelayMs: string;
+    seedProfile?: boolean;
   }) => {
+    const submitDelayMs = Number(options.submitDelayMs);
     const result = await runParallelFeasibility({
       targetDate: options.date,
       slots: [options.slotA, options.slotB],
       submit: options.submit,
+      submitDelayMs,
+      seedProfile: options.seedProfile,
     });
     console.log(options.submit
       ? "PARALLEL_SUBMIT_COMPLETE：双路真实提交已结束"

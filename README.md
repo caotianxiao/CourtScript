@@ -118,7 +118,8 @@ courtscript parallel-feasibility --date 2026-09-24 \
 命令会创建两套临时隔离 profile、启动两个普通 Edge 根进程、同时刷新并分别选中
 两个时段，要求两边的预约提交请求数均为零，然后关闭进程并删除临时 profile。
 只有在明确授权真实预约时才可附加 `--submit`；该模式严格使用两个指定时段，每路
-最多提交一次，不会回退到其他时段。实测同毫秒双提交只成功了一笔，因此不应直接用于
-正式抢场。
+最多提交一次，不会回退到其他时段。`--submit-delay-ms 150` 可让 B 相对 A 错峰提交，
+`--seed-profile` 会从 CourtScript 专用登录 profile 创建两份仅用于本轮的临时副本。
+实测同毫秒双提交只成功一笔，150 ms 错峰成功两笔；后者仍需更多轮验证后才能用于正式抢场。
 实测结论和正式并发版本的约束见
 [`docs/parallel-first-priority-feasibility.md`](docs/parallel-first-priority-feasibility.md)。
