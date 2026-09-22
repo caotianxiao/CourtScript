@@ -535,10 +535,11 @@ async function verifyAppointment(targetDate: string, slot: string): Promise<bool
   return waitForCourtJavaScript<{ found: boolean }>(
     `(() => {
       const targetDate = ${JSON.stringify(targetDate)};
+      const shortDate = targetDate.slice(5);
       const slot = ${JSON.stringify(slot)};
       const found = Array.from(document.querySelectorAll('tr')).some((row) => {
         const text = row.innerText.replace(/\\s+/g, ' ').trim();
-        return text.includes(targetDate)
+        return (text.includes(targetDate) || text.includes(shortDate))
           && text.includes(slot)
           && !text.includes('已取消')
           && (text.includes('已预约') || text.includes('取消预约'));

@@ -157,16 +157,25 @@ plan
 
 program
   .command("parallel-feasibility")
-  .description("用两个隔离 Edge profile 并发验证两个时段，不提交预约")
+  .description("用两个隔离 Edge profile 并发验证或提交两个时段")
   .requiredOption("--date <YYYY-MM-DD>", "验证日期")
   .requiredOption("--slot-a <HH:mm-HH:mm>", "Edge A 的时段")
   .requiredOption("--slot-b <HH:mm-HH:mm>", "Edge B 的时段")
-  .action(async (options: { date: string; slotA: string; slotB: string }) => {
+  .option("--submit", "两个 Edge 各单次真实提交精确目标时段")
+  .action(async (options: {
+    date: string;
+    slotA: string;
+    slotB: string;
+    submit?: boolean;
+  }) => {
     const result = await runParallelFeasibility({
       targetDate: options.date,
       slots: [options.slotA, options.slotB],
+      submit: options.submit,
     });
-    console.log("PARALLEL_FEASIBLE：两个独立 Edge 已同时选中不同时段，未提交");
+    console.log(options.submit
+      ? "PARALLEL_SUBMIT_COMPLETE：双路真实提交已结束"
+      : "PARALLEL_FEASIBLE：两个独立 Edge 已同时选中不同时段，未提交");
     console.log(JSON.stringify(result, null, 2));
   });
 

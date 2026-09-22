@@ -180,10 +180,12 @@ interface BrowserProbe {
   refreshMs: number;
   selectionMs: number;
   launchRequests: number;
+  launchResponseStatuses: number[];
 }
 
 export interface ParallelFeasibilityResult {
-  status: "feasible";
+  status: "feasible" | "confirmed" | "ambiguous";
+  mode: "dry-run" | "submit";
   controlMethod: "ordinary-edge-raw-cdp";
   targetDate: string;
   requestedSlots: [string, string];
@@ -191,7 +193,9 @@ export interface ParallelFeasibilityResult {
   distinctRootProcesses: boolean;
   distinctProfiles: boolean;
   refreshStartSkewMs: number;
+  submitStartSkewMs?: number;
   simultaneousSelectionsHeld: boolean;
+  recordsFound?: [boolean, boolean];
   browsers: [BrowserProbe, BrowserProbe];
 }
 
@@ -543,6 +547,78 @@ async function selectWithoutSubmitting(
   throw new Error(`${targetDate} ${slot} 经 4 次尝试仍未选中`);
 }
 
+async function submitExactSelection(
+  page: RawCdpPage,
+  targetDate: string,
+  slot: string,
+): Promise<number> {
+  const result = await page.evaluate(({ targetDate, slot }) => {
+    const expected = `${targetDate} ${slot}`;
+    const summary = Array.from(document.querySelectorAll<HTMLElement>("*"))
+      .some((item) => item.innerText?.trim().replace(/\s+/g, " ") === expected);
+    const phone = document.querySelector<HTMLInputElement>(
+      'input[placeholder="请输入手机号"]',
+    );
+    const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      .find((item) => item.innerText.trim() === "确认预约");
+    if (!summary || !phone?.value.trim()) {
+      return { clicked: false, reason: "selection-missing" };
+    }
+    if (!button) return { clicked: false, reason: "button-missing" };
+    const clickedAt = Date.now();
+    button.click();
+    return { clicked: true, clickedAt };
+  }, { targetDate, slot });
+  if (!result.clicked || !result.clickedAt) {
+    throw new Error(
+      `${targetDate} ${slot} 提交前核验失败：${result.reason ?? "unknown"}`,
+    );
+  }
+  return result.clickedAt;
+}
+
+async function verifyAppointmentSlots(
+  page: RawCdpPage,
+  targetDate: string,
+  slots: [string, string],
+): Promise<[boolean, boolean]> {
+  const clickDeadline = Date.now() + 8_000;
+  let clicked = false;
+  while (Date.now() < clickDeadline && !clicked) {
+    clicked = await page.evaluate(() => {
+      const nav = Array.from(document.querySelectorAll<HTMLElement>("*"))
+        .filter((item) => item.innerText?.trim() === "我的预约")
+        .sort((left, right) => left.children.length - right.children.length)[0];
+      if (!nav) return false;
+      nav.click();
+      return true;
+    }).catch(() => false);
+    if (!clicked) await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (!clicked) return [false, false];
+
+  const deadline = Date.now() + 12_000;
+  let found: [boolean, boolean] = [false, false];
+  while (Date.now() < deadline) {
+    found = await page.evaluate(({ targetDate, slots }) => {
+      const shortDate = targetDate.slice(5);
+      const rows = Array.from(document.querySelectorAll<HTMLElement>("tr"))
+        .map((row) => row.innerText.replace(/\s+/g, " ").trim())
+        .filter((text) =>
+          (text.includes(targetDate) || text.includes(shortDate))
+          && !text.includes("已取消"),
+        );
+      return slots.map((slot) => rows.some((text) =>
+        text.includes(slot)
+        && (text.includes("已预约") || text.includes("取消预约")),
+      )) as [boolean, boolean];
+    }, { targetDate, slots }).catch(() => [false, false] as [boolean, boolean]);
+    if (found.every(Boolean)) return found;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return found;
+}
+
 function chooseTestSlots(
   requested: [string, string],
   stateA: GridState,
@@ -591,6 +667,7 @@ async function removeExperimentProfiles(): Promise<void> {
 export async function runParallelFeasibility(options: {
   targetDate: string;
   slots: [string, string];
+  submit?: boolean;
 }): Promise<ParallelFeasibilityResult> {
   const targetDate = validateDate(options.targetDate);
   const requestedSlots: [string, string] = [
@@ -628,12 +705,28 @@ export async function runParallelFeasibility(options: {
       waitForGrid(browserA.page, targetDate),
       waitForGrid(browserB.page, targetDate),
     ]);
-    const testedSlots = chooseTestSlots(requestedSlots, initialA, initialB);
+    if (options.submit && (
+      !initialA.availableSlots.includes(requestedSlots[0])
+      || !initialB.availableSlots.includes(requestedSlots[1])
+    )) {
+      throw new Error(
+        `真实双提交只允许精确目标时段，当前状态：${JSON.stringify({
+          slotA: requestedSlots[0],
+          availableA: initialA.availableSlots.includes(requestedSlots[0]),
+          slotB: requestedSlots[1],
+          availableB: initialB.availableSlots.includes(requestedSlots[1]),
+        })}`,
+      );
+    }
+    const testedSlots = options.submit
+      ? requestedSlots
+      : chooseTestSlots(requestedSlots, initialA, initialB);
     console.log(
       `[${new Date().toISOString()}] PARALLEL_PHASE：并发验证时段 ${testedSlots.join(" + ")}`,
     );
 
     const requestCounts = [0, 0];
+    const responseStatuses: [number[], number[]] = [[], []];
     await Promise.all([browserA, browserB].map(async (instance, index) => {
       instance.cdp.on("Network.requestWillBeSent", (params) => {
         const url = (params as { request?: { url?: string } }).request?.url;
@@ -644,6 +737,19 @@ export async function runParallelFeasibility(options: {
           }
         } catch {
           // Ignore malformed non-HTTP request URLs.
+        }
+      });
+      instance.cdp.on("Network.responseReceived", (params) => {
+        const response = (params as {
+          response?: { url?: string; status?: number };
+        }).response;
+        if (!response?.url) return;
+        try {
+          if (new URL(response.url).pathname === LAUNCH_PATH) {
+            responseStatuses[index]?.push(Number(response.status) || 0);
+          }
+        } catch {
+          // Ignore malformed non-HTTP response URLs.
         }
       });
       await instance.cdp.send("Network.enable");
@@ -678,6 +784,29 @@ export async function runParallelFeasibility(options: {
     }
     console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：两个时段已同时选中`);
 
+    let submitStartSkewMs: number | undefined;
+    let recordsFound: [boolean, boolean] | undefined;
+    if (options.submit) {
+      console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：双路各单次点击确认预约`);
+      const submitStarts = await Promise.all([
+        submitExactSelection(browserA.page, targetDate, testedSlots[0]),
+        submitExactSelection(browserB.page, targetDate, testedSlots[1]),
+      ]);
+      submitStartSkewMs = Math.abs(submitStarts[0] - submitStarts[1]);
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      if (requestCounts.some((count) => count > 1)) {
+        throw new Error(`预约提交请求次数异常：${requestCounts.join(",")}`);
+      }
+      recordsFound = await verifyAppointmentSlots(
+        browserA.page,
+        targetDate,
+        testedSlots,
+      );
+      console.log(
+        `[${new Date().toISOString()}] PARALLEL_PHASE：我的预约核验 ${JSON.stringify(recordsFound)}`,
+      );
+    }
+
     const probes: [BrowserProbe, BrowserProbe] = [browserA, browserB].map(
       (instance, index) => ({
         label: instance.label,
@@ -692,10 +821,14 @@ export async function runParallelFeasibility(options: {
         refreshMs: refreshDurations[index] ?? 0,
         selectionMs: selections[index]?.selectionMs ?? 0,
         launchRequests: requestCounts[index] ?? 0,
+        launchResponseStatuses: responseStatuses[index] ?? [],
       }),
     ) as [BrowserProbe, BrowserProbe];
     return {
-      status: "feasible",
+      status: options.submit
+        ? (recordsFound?.every(Boolean) ? "confirmed" : "ambiguous")
+        : "feasible",
+      mode: options.submit ? "submit" : "dry-run",
       controlMethod: "ordinary-edge-raw-cdp",
       targetDate,
       requestedSlots,
@@ -705,7 +838,9 @@ export async function runParallelFeasibility(options: {
         && probes[0].rootPid !== probes[1].rootPid,
       distinctProfiles: profileA !== profileB,
       refreshStartSkewMs: Math.abs((refreshStarts[0] ?? 0) - (refreshStarts[1] ?? 0)),
+      submitStartSkewMs,
       simultaneousSelectionsHeld,
+      recordsFound,
       browsers: probes,
     };
   } finally {
