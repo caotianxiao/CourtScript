@@ -22,6 +22,7 @@ const PAGE_TIMEOUT = 30_000;
 export interface ReservationRunOptions {
   notBefore?: Date;
   maxLatenessMs?: number;
+  deferVerification?: boolean;
 }
 
 async function waitUntilRelease(
@@ -315,20 +316,10 @@ export async function runReservation(
     console.log(`[${new Date().toISOString()}] RUN_PHASE：按优先级选择目标时段`);
     const selection = await selectSlot(plan.targetDate, plan.slots);
     selectedSlot = selection.slot;
-    await focusCourtTab();
     if (mode === "dry-run") {
+      await focusCourtTab();
       await captureCourtWindow(artifacts.screenshotPath);
       screenshot = artifacts.screenshotPath;
-    } else {
-      try {
-        await captureCourtWindow(artifacts.screenshotPath);
-        screenshot = artifacts.screenshotPath;
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        console.warn(
-          `[${new Date().toISOString()}] RUN_WARNING：锁屏状态无法截图，继续实订：${detail}`,
-        );
-      }
     }
 
     if (mode === "dry-run") {
@@ -362,6 +353,32 @@ export async function runReservation(
     }
     console.log(`[${new Date().toISOString()}] RUN_PHASE：二次核验通过，单次点击确认预约`);
     await submitReservation();
+    if (options.deferVerification) {
+      // Give the page's click handler enough time to dispatch its request, but
+      // do not block the next priority on screenshots or My Reservation.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      launchRequests = await countLaunchRequests();
+      if (launchRequests > 1) {
+        throw new Error(`预约提交请求次数异常：${launchRequests}`);
+      }
+      const result: ReservationResult = {
+        mode,
+        planId: plan.id,
+        targetDate: plan.targetDate,
+        selectedSlot,
+        status: "submitted",
+        message: `已提交，延后核验：${plan.targetDate} ${selectedSlot}`,
+        launchRequests,
+      };
+      await writeResultLog(artifacts.logPath, result);
+      await updatePlan(
+        plan.id,
+        "submitted",
+        { at: new Date().toISOString(), mode, slot: selectedSlot, result: "submitted" },
+        result,
+      );
+      return result;
+    }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
     launchRequests = await countLaunchRequests();
     if (launchRequests > 1) {
@@ -415,6 +432,23 @@ export async function runReservation(
       result,
     ).catch(() => undefined);
     throw error;
+  } finally {
+    if (normalEdgeStarted) {
+      await closeCourtWindow().catch(() => undefined);
+      await stopDedicatedEdge().catch(() => undefined);
+    }
+  }
+}
+
+export async function verifyReservationRecord(
+  targetDate: string,
+  slot: string,
+): Promise<boolean> {
+  let normalEdgeStarted = false;
+  try {
+    normalEdgeStarted = true;
+    await openAuthenticatedReservationPage();
+    return await verifyAppointment(targetDate, slot);
   } finally {
     if (normalEdgeStarted) {
       await closeCourtWindow().catch(() => undefined);

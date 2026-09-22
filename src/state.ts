@@ -173,6 +173,23 @@ export async function updatePlan(
   return plan;
 }
 
+export async function reconcilePlanResult(
+  planId: string,
+  status: PlanStatus,
+  result: ReservationResult,
+): Promise<ReservationPlan> {
+  const store = await loadStore();
+  const plan = store.plans.find((item) => item.id === planId);
+  if (!plan) {
+    throw new Error(`找不到计划：${planId}`);
+  }
+  plan.status = status;
+  plan.updatedAt = new Date().toISOString();
+  plan.result = result;
+  await saveStore(store);
+  return plan;
+}
+
 export async function updatePriorityPair(
   pairId: string,
   status: PriorityPairStatus,

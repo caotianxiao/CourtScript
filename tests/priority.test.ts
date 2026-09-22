@@ -34,6 +34,11 @@ describe("priority pair status", () => {
       .toBe("ambiguous");
   });
 
+  it("treats an unverified submitted child as ambiguous", () => {
+    expect(priorityResultStatus(result("submitted"), result("failed"), "submit"))
+      .toBe("ambiguous");
+  });
+
   it("marks two dry-runs ready", () => {
     expect(priorityResultStatus(
       result("ready", "dry-run"),

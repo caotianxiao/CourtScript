@@ -1,6 +1,10 @@
-import { runReservation } from "./reservation.js";
+import {
+  runReservation,
+  verifyReservationRecord,
+} from "./reservation.js";
 import {
   findPlan,
+  reconcilePlanResult,
   updatePriorityPair,
 } from "./state.js";
 import type {
@@ -14,6 +18,7 @@ import type {
 export interface PriorityRunOptions {
   notBefore?: Date;
   maxLatenessMs?: number;
+  deferVerification?: boolean;
 }
 
 function failedResult(
@@ -43,6 +48,9 @@ async function runChild(
     console.log(
       `[${new Date().toISOString()}] PRIORITY_PHASE：子计划 ${plan.id} 已成功，跳过重复提交`,
     );
+    return previous;
+  }
+  if (mode === "submit" && previous?.status === "submitted") {
     return previous;
   }
   if (
@@ -92,6 +100,9 @@ export function priorityResultStatus(
   if (high.status === "ambiguous" || low.status === "ambiguous") {
     return "ambiguous";
   }
+  if (high.status === "submitted" || low.status === "submitted") {
+    return "ambiguous";
+  }
   if (highSucceeded || lowSucceeded) {
     return "partial";
   }
@@ -107,12 +118,30 @@ export async function runPriorityPair(
   console.log(
     `[${new Date().toISOString()}] PRIORITY_PHASE：开始高优先级 ${pair.highDate} ${pair.highSlot}`,
   );
-  const high = await runChild(pair.highPlanId, mode, options);
+  let high = await runChild(pair.highPlanId, mode, {
+    ...options,
+    deferVerification: mode === "submit",
+  });
 
   console.log(
     `[${new Date().toISOString()}] PRIORITY_PHASE：高优先级结束（${high.status}），立即从 eHall 开始低优先级 ${pair.lowDate} ${pair.lowSlot}`,
   );
   const low = await runChild(pair.lowPlanId, mode, {});
+  if (mode === "submit" && high.status === "submitted") {
+    console.log(
+      `[${new Date().toISOString()}] PRIORITY_PHASE：两个抢场动作均已结束，补做高优先级核验`,
+    );
+    const found = await verifyReservationRecord(pair.highDate, pair.highSlot)
+      .catch(() => false);
+    high = {
+      ...high,
+      status: found ? "confirmed" : "ambiguous",
+      message: found
+        ? `预约成功：${pair.highDate} ${pair.highSlot}`
+        : "高优先级已提交，但事后未在我的预约中确认，禁止自动重试",
+    };
+    await reconcilePlanResult(pair.highPlanId, high.status, high);
+  }
   const status = priorityResultStatus(high, low, mode);
   const message = [
     `优先级计划 ${pair.id}：${status}`,

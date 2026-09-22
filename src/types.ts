@@ -1,6 +1,7 @@
 export type PlanStatus =
   | "pending"
   | "ready"
+  | "submitted"
   | "confirmed"
   | "failed"
   | "ambiguous"
@@ -21,7 +22,7 @@ export interface ReservationResult {
   planId: string;
   targetDate: string;
   selectedSlot?: string;
-  status: "ready" | "confirmed" | "failed" | "ambiguous";
+  status: "ready" | "submitted" | "confirmed" | "failed" | "ambiguous";
   message: string;
   launchRequests: number;
   screenshot?: string;
