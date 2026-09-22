@@ -120,6 +120,7 @@ courtscript parallel-feasibility --date 2026-09-24 \
 只有在明确授权真实预约时才可附加 `--submit`；该模式严格使用两个指定时段，每路
 最多提交一次，不会回退到其他时段。`--submit-delay-ms 150` 可让 B 相对 A 错峰提交，
 `--seed-profile` 会从 CourtScript 专用登录 profile 创建两份仅用于本轮的临时副本。
-实测同毫秒双提交只成功一笔，150 ms 错峰成功两笔；后者仍需更多轮验证后才能用于正式抢场。
+实测同毫秒双提交只成功一笔，150 ms 错峰已连续两轮成功两笔；正式使用仍需考虑
+07:00 高竞争环境与登录态稳定性。
 实测结论和正式并发版本的约束见
 [`docs/parallel-first-priority-feasibility.md`](docs/parallel-first-priority-feasibility.md)。

@@ -473,10 +473,16 @@ function gridStateScript(targetDate: string): string {
 async function waitForGrid(page: RawCdpPage, targetDate: string): Promise<GridState> {
   const deadline = Date.now() + GRID_TIMEOUT;
   let lastState: GridState | undefined;
+  let readyStreak = 0;
   while (Date.now() < deadline) {
     lastState = await page.evaluate<GridState>(gridStateScript(targetDate))
       .catch(() => undefined);
-    if (lastState?.ready) return lastState;
+    if (lastState?.ready) {
+      readyStreak += 1;
+      if (readyStreak >= 5) return lastState;
+    } else {
+      readyStreak = 0;
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(
@@ -491,7 +497,7 @@ async function selectWithoutSubmitting(
 ): Promise<{ availability: string; selectionMs: number }> {
   const started = Date.now();
   let availability = "";
-  for (let attempt = 0; attempt < 8; attempt += 1) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
     const state = await page.evaluate(({ targetDate, slot }) => {
       const expected = `${targetDate} ${slot}`;
       const summary = Array.from(document.querySelectorAll<HTMLElement>("*"))
@@ -552,7 +558,7 @@ async function selectWithoutSubmitting(
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
-  throw new Error(`${targetDate} ${slot} 经 8 次尝试仍未选中`);
+  throw new Error(`${targetDate} ${slot} 经 20 次尝试仍未选中`);
 }
 
 async function submitExactSelection(
