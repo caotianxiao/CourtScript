@@ -42,13 +42,36 @@ async function waitUntilRelease(
   }
 }
 
-async function reloadReservationTable(): Promise<void> {
+export async function reloadReservationTable(): Promise<void> {
   await executeCourtJavaScript("location.reload(); JSON.stringify({reloading: true})");
-  await waitForCourtJavaScript<{ ready: boolean; url: string }>(
-    `JSON.stringify({
-      ready: Boolean(document.querySelector('.week_calendar')),
-      url: location.href
-    })`,
+  await waitForCourtJavaScript<{
+    ready: boolean;
+    url: string;
+    timeCount: number;
+    columnCount: number;
+    completeColumnCount: number;
+  }>(
+    `(() => {
+      const times = Array.from(
+        document.querySelectorAll('.left_time dd.resource_item_info'),
+      ).map((item) => item.innerText.trim());
+      const columns = Array.from(document.querySelectorAll('.reservation_data'));
+      const completeColumnCount = columns.filter((column) => {
+        const cells = Array.from(column.querySelectorAll('dd.resource_item_info'));
+        return cells.length === 14 && cells.every((cell) => cell.innerText.trim().length > 0);
+      }).length;
+      return JSON.stringify({
+        ready: Boolean(document.querySelector('.week_calendar'))
+          && times.length === 14
+          && times.every((time) => /^\\d{2}:\\d{2}-\\d{2}:\\d{2}$/.test(time))
+          && columns.length > 0
+          && completeColumnCount === columns.length,
+        url: location.href,
+        timeCount: times.length,
+        columnCount: columns.length,
+        completeColumnCount,
+      });
+    })()`,
     (value) => value.ready && value.url.includes("reservationInfo?id=1055"),
     PAGE_TIMEOUT,
     "预约资源刷新",
@@ -105,24 +128,43 @@ async function selectSlot(
   targetDate: string,
   slots: string[],
 ): Promise<SlotSelection> {
-  const output = await executeCourtJavaScript(`(() => {
+  const result = await waitForCourtJavaScript<SlotSelection & {
+    state: "loading" | "selected" | "unavailable" | "error";
+    error?: string;
+    timeCount?: number;
+    cellCount?: number;
+  }>(`(() => {
     const targetDate = ${JSON.stringify(targetDate)};
     const slots = ${JSON.stringify(slots)};
     const times = Array.from(
       document.querySelectorAll('.left_time dd.resource_item_info'),
     ).map((item) => item.innerText.trim());
-    if (times.length !== 14) {
-      return JSON.stringify({error: '页面时段数量异常：期望 14，实际 ' + times.length});
+    if (times.length !== 14
+        || times.some((time) => !/^\\d{2}:\\d{2}-\\d{2}:\\d{2}$/.test(time))) {
+      return JSON.stringify({state: 'loading', timeCount: times.length});
     }
     const columns = Array.from(document.querySelectorAll('.reservation_data'));
     const matches = columns.filter((column) =>
       Array.from(column.querySelectorAll('.week_header span'))
         .some((span) => span.innerText.trim() === targetDate),
     );
-    if (matches.length !== 1) {
-      return JSON.stringify({error: '无法唯一定位日期列：' + targetDate});
+    if (matches.length === 0) {
+      return JSON.stringify({state: 'loading', timeCount: times.length});
+    }
+    if (matches.length > 1) {
+      return JSON.stringify({
+        state: 'error',
+        error: '无法唯一定位日期列：' + targetDate,
+      });
     }
     const cells = Array.from(matches[0].querySelectorAll('dd.resource_item_info'));
+    if (cells.length !== 14 || cells.some((cell) => cell.innerText.trim().length === 0)) {
+      return JSON.stringify({
+        state: 'loading',
+        timeCount: times.length,
+        cellCount: cells.length,
+      });
+    }
     for (const slot of slots) {
       const index = times.indexOf(slot);
       const cell = index >= 0 ? cells[index] : undefined;
@@ -131,13 +173,22 @@ async function selectSlot(
       if (!text.includes('可预约') || !cell.classList.contains('can_active')) continue;
       cell.scrollIntoView({block: 'center'});
       cell.click();
-      return JSON.stringify({slot, availability: text});
+      return JSON.stringify({state: 'selected', slot, availability: text});
     }
-    return JSON.stringify({error: '首选和备选时段均不可预约：' + slots.join(', ')});
-  })()`);
-  const result = JSON.parse(output) as SlotSelection & { error?: string };
+    return JSON.stringify({
+      state: 'unavailable',
+      error: '首选和备选时段均不可预约：' + slots.join(', '),
+    });
+  })()`,
+  (value) => value.state !== "loading",
+  PAGE_TIMEOUT,
+  "等待完整预约表格",
+  );
   if (result.error) {
     throw new Error(result.error);
+  }
+  if (result.state !== "selected" || !result.slot || !result.availability) {
+    throw new Error("预约表格返回了无法识别的选择状态");
   }
   await waitForCourtJavaScript<{ summary: boolean; phone: boolean }>(
     `(() => {
