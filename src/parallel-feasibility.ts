@@ -331,10 +331,11 @@ async function assign(page: RawCdpPage, url: string): Promise<void> {
 async function openReservation(
   instance: EdgeInstance,
   credentials: StoredCredentials,
+  timeoutMs = PAGE_TIMEOUT,
 ): Promise<void> {
   const started = Date.now();
   await assign(instance.page, EHALL_URL);
-  const deadline = Date.now() + PAGE_TIMEOUT;
+  const deadline = Date.now() + timeoutMs;
   let loginSubmitted = false;
   let lastLoginClick = 0;
   let specialStarted = false;
@@ -438,6 +439,43 @@ async function openReservation(
   throw new Error(
     `Edge ${instance.label} 进入预约表超时：${JSON.stringify(lastState ?? {}).slice(0, 400)}`,
   );
+}
+
+async function openReservationWithRetries(
+  instance: EdgeInstance,
+  credentials: StoredCredentials,
+  attempts: number,
+  timeoutMs: number,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await openReservation(instance, credentials, timeoutMs);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      console.log(
+        `[${new Date().toISOString()}] PARALLEL_PHASE：Edge ${instance.label} 登录失败，重新从 eHall 尝试（${attempt + 1}/${attempts}）`,
+      );
+      await assign(instance.page, EHALL_URL);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  throw lastError;
+}
+
+async function waitUntilRelease(at: Date, maxLatenessMs: number): Promise<void> {
+  if (Date.now() > at.getTime() + maxLatenessMs) {
+    throw new Error(`已错过双提交执行窗口：${at.toISOString()}`);
+  }
+  while (Date.now() < at.getTime()) {
+    const remaining = at.getTime() - Date.now();
+    await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 500)));
+  }
+  if (Date.now() > at.getTime() + maxLatenessMs) {
+    throw new Error(`登录或唤醒延误，已超过双提交执行窗口：${at.toISOString()}`);
+  }
 }
 
 function gridStateScript(targetDate: string): string {
@@ -684,6 +722,10 @@ export async function runParallelFeasibility(options: {
   submit?: boolean;
   submitDelayMs?: number;
   seedProfile?: boolean;
+  notBefore?: Date;
+  maxLatenessMs?: number;
+  loginAttempts?: number;
+  loginTimeoutMs?: number;
 }): Promise<ParallelFeasibilityResult> {
   const targetDate = validateDate(options.targetDate);
   const requestedSlots: [string, string] = [
@@ -699,6 +741,18 @@ export async function runParallelFeasibility(options: {
   }
   if (!options.submit && submitDelayMs !== 0) {
     throw new Error("只有真实提交模式允许设置提交错峰");
+  }
+  if (options.notBefore && !options.submit) {
+    throw new Error("准点等待只允许用于真实提交模式");
+  }
+  const maxLatenessMs = options.maxLatenessMs ?? 120_000;
+  const loginAttempts = options.loginAttempts ?? 1;
+  const loginTimeoutMs = options.loginTimeoutMs ?? PAGE_TIMEOUT;
+  if (!Number.isInteger(loginAttempts) || loginAttempts < 1 || loginAttempts > 5) {
+    throw new Error("登录尝试次数必须是 1–5 的整数");
+  }
+  if (!Number.isFinite(loginTimeoutMs) || loginTimeoutMs < 5_000) {
+    throw new Error("单次登录超时不能少于 5 秒");
   }
   const credentials = await loadStoredCredentials();
   if (!credentials) throw new Error("并发验证需要已保存的统一身份认证凭据");
@@ -734,31 +788,19 @@ export async function runParallelFeasibility(options: {
       launchOrdinaryEdge("B", profileB, portB),
     ]);
     await Promise.all([
-      openReservation(browserA, credentials),
-      openReservation(browserB, credentials),
+      openReservationWithRetries(browserA, credentials, loginAttempts, loginTimeoutMs),
+      openReservationWithRetries(browserB, credentials, loginAttempts, loginTimeoutMs),
     ]);
     console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：两个 Edge 登录均完成`);
 
-    const [initialA, initialB] = await Promise.all([
-      waitForGrid(browserA.page, targetDate),
-      waitForGrid(browserB.page, targetDate),
-    ]);
-    if (options.submit && (
-      !initialA.availableSlots.includes(requestedSlots[0])
-      || !initialB.availableSlots.includes(requestedSlots[1])
-    )) {
-      throw new Error(
-        `真实双提交只允许精确目标时段，当前状态：${JSON.stringify({
-          slotA: requestedSlots[0],
-          availableA: initialA.availableSlots.includes(requestedSlots[0]),
-          slotB: requestedSlots[1],
-          availableB: initialB.availableSlots.includes(requestedSlots[1]),
-        })}`,
-      );
+    let testedSlots = requestedSlots;
+    if (!options.submit) {
+      const [initialA, initialB] = await Promise.all([
+        waitForGrid(browserA.page, targetDate),
+        waitForGrid(browserB.page, targetDate),
+      ]);
+      testedSlots = chooseTestSlots(requestedSlots, initialA, initialB);
     }
-    const testedSlots = options.submit
-      ? requestedSlots
-      : chooseTestSlots(requestedSlots, initialA, initialB);
     console.log(
       `[${new Date().toISOString()}] PARALLEL_PHASE：并发验证时段 ${testedSlots.join(" + ")}`,
     );
@@ -811,17 +853,38 @@ export async function runParallelFeasibility(options: {
       });
       await instance.cdp.send("Network.enable");
     }));
-    const releaseAt = Date.now() + 1_500;
+    const releaseAt = options.notBefore?.getTime() ?? Date.now() + 1_500;
+    if (options.notBefore) {
+      console.log(
+        `[${new Date().toISOString()}] PARALLEL_PHASE：双路预登录完成，等待 ${options.notBefore.toISOString()}`,
+      );
+      await waitUntilRelease(options.notBefore, maxLatenessMs);
+      console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：开放时刻已到`);
+    }
     const refreshStarts = [0, 0];
     const refreshDurations = [0, 0];
-    await Promise.all([browserA, browserB].map(async (instance, index) => {
+    const refreshedStates = await Promise.all([browserA, browserB].map(async (instance, index) => {
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, releaseAt - Date.now())));
       refreshStarts[index] = Date.now();
       await instance.page.reload().catch(() => undefined);
-      await waitForGrid(instance.page, targetDate);
+      const state = await waitForGrid(instance.page, targetDate);
       refreshDurations[index] = Date.now() - refreshStarts[index];
+      return state;
     }));
     console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：两个 Edge 已并发刷新`);
+    if (options.submit && (
+      !refreshedStates[0]?.availableSlots.includes(requestedSlots[0])
+      || !refreshedStates[1]?.availableSlots.includes(requestedSlots[1])
+    )) {
+      throw new Error(
+        `真实双提交只允许精确目标时段，刷新后状态：${JSON.stringify({
+          slotA: requestedSlots[0],
+          availableA: refreshedStates[0]?.availableSlots.includes(requestedSlots[0]),
+          slotB: requestedSlots[1],
+          availableB: refreshedStates[1]?.availableSlots.includes(requestedSlots[1]),
+        })}`,
+      );
+    }
 
     const selections = await Promise.all([
       selectWithoutSubmitting(browserA.page, targetDate, testedSlots[0]),

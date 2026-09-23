@@ -101,7 +101,10 @@ const exitCode = await new Promise((resolve) => {
   child.once("error", () => resolve(1));
   child.once("close", (code) => resolve(code ?? 1));
 });
-await unlink(${JSON.stringify(plistPath)}).catch(() => undefined);
+await Promise.all([
+  unlink(${JSON.stringify(plistPath)}).catch(() => undefined),
+  unlink(${JSON.stringify(runnerPath)}).catch(() => undefined)
+]);
 const cleanup = spawn("/bin/launchctl", [
   "bootout", ${JSON.stringify(serviceTarget)}
 ], {detached: true, stdio: "ignore"});
@@ -196,6 +199,38 @@ export async function installPrioritySchedule(
       "--submit",
       "--not-before", at.toISOString(),
       "--max-lateness-seconds", "120",
+    ],
+    at,
+    prepareMinutes,
+  );
+}
+
+export async function installParallelSchedule(
+  targetDate: string,
+  slotA: string,
+  slotB: string,
+  at: Date,
+  prepareMinutes: number,
+  submitDelayMs: number,
+): Promise<OneShotSchedule> {
+  const suffix = [targetDate, slotA, slotB]
+    .join(".")
+    .replaceAll(":", "")
+    .replaceAll("-", "");
+  return installSchedule(
+    `parallel.${suffix}`,
+    [
+      "run-parallel",
+      "--date", targetDate,
+      "--slot-a", slotA,
+      "--slot-b", slotB,
+      "--submit",
+      "--submit-delay-ms", String(submitDelayMs),
+      "--seed-profile",
+      "--not-before", at.toISOString(),
+      "--max-lateness-seconds", "120",
+      "--login-attempts", "3",
+      "--login-timeout-seconds", "25",
     ],
     at,
     prepareMinutes,

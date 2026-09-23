@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { importEdgeSession, checkDedicatedSession, manualLogin } from "./auth.js";
+import { LOG_DIR } from "./constants.js";
 import {
   clearStoredCredentials,
   saveCredentialsFromDialog,
@@ -16,10 +19,16 @@ import { runReservation } from "./reservation.js";
 import { runPriorityPair } from "./priority.js";
 import {
   installOneShotSchedule,
+  installParallelSchedule,
   installPrioritySchedule,
 } from "./scheduler.js";
 import type { RunMode } from "./types.js";
-import { releaseDateFor, shanghaiDate } from "./validation.js";
+import {
+  releaseDateFor,
+  shanghaiDate,
+  validateDate,
+  validateSlot,
+} from "./validation.js";
 import { runParallelFeasibility } from "./parallel-feasibility.js";
 
 function parseTimestamp(value: string, optionName: string): Date {
@@ -31,6 +40,15 @@ function parseTimestamp(value: string, optionName: string): Date {
     throw new Error(`无法解析 ${optionName}：${value}`);
   }
   return parsed;
+}
+
+async function writeParallelLog(result: unknown): Promise<string> {
+  await mkdir(LOG_DIR, { recursive: true, mode: 0o700 });
+  const stamp = new Date().toISOString().replaceAll(":", "-");
+  const path = join(LOG_DIR, `parallel-${stamp}.json`);
+  await writeFile(path, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
+  await chmod(path, 0o600);
+  return path;
 }
 
 const program = new Command();
@@ -172,7 +190,7 @@ program
     submitDelayMs: string;
     seedProfile?: boolean;
   }) => {
-    const submitDelayMs = Number(options.submitDelayMs);
+    const submitDelayMs = options.submit ? Number(options.submitDelayMs) : 0;
     const result = await runParallelFeasibility({
       targetDate: options.date,
       slots: [options.slotA, options.slotB],
@@ -184,6 +202,68 @@ program
       ? "PARALLEL_SUBMIT_COMPLETE：双路真实提交已结束"
       : "PARALLEL_FEASIBLE：两个独立 Edge 已同时选中不同时段，未提交");
     console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("run-parallel")
+  .description("正式运行双 Edge 精确双时段预约")
+  .requiredOption("--date <YYYY-MM-DD>", "预约日期")
+  .requiredOption("--slot-a <HH:mm-HH:mm>", "Edge A 的时段")
+  .requiredOption("--slot-b <HH:mm-HH:mm>", "Edge B 的时段")
+  .option("--dry-run", "只同时选中两个时段，不提交")
+  .option("--submit", "两个 Edge 各单次真实提交")
+  .option("--submit-delay-ms <milliseconds>", "B 相对 A 的提交延迟", "150")
+  .option("--seed-profile", "从 CourtScript 专用 profile 创建两份临时副本")
+  .option("--not-before <ISO-8601>", "完成双路预登录后等待到指定时刻")
+  .option("--max-lateness-seconds <seconds>", "超过指定秒数仍未开始则放弃", "120")
+  .option("--login-attempts <attempts>", "每路最多登录尝试次数", "3")
+  .option("--login-timeout-seconds <seconds>", "单次登录超时", "25")
+  .action(async (options: {
+    date: string;
+    slotA: string;
+    slotB: string;
+    dryRun?: boolean;
+    submit?: boolean;
+    submitDelayMs: string;
+    seedProfile?: boolean;
+    notBefore?: string;
+    maxLatenessSeconds: string;
+    loginAttempts: string;
+    loginTimeoutSeconds: string;
+  }) => {
+    if (Boolean(options.dryRun) === Boolean(options.submit)) {
+      throw new Error("必须且只能指定 --dry-run 或 --submit");
+    }
+    const notBefore = options.notBefore
+      ? parseTimestamp(options.notBefore, "--not-before")
+      : undefined;
+    const submitDelayMs = options.submit ? Number(options.submitDelayMs) : 0;
+    const maxLatenessSeconds = Number(options.maxLatenessSeconds);
+    const loginAttempts = Number(options.loginAttempts);
+    const loginTimeoutSeconds = Number(options.loginTimeoutSeconds);
+    if (!Number.isFinite(maxLatenessSeconds) || maxLatenessSeconds <= 0) {
+      throw new Error("--max-lateness-seconds 必须是正数");
+    }
+    const result = await runParallelFeasibility({
+      targetDate: options.date,
+      slots: [options.slotA, options.slotB],
+      submit: options.submit,
+      submitDelayMs,
+      seedProfile: options.seedProfile,
+      notBefore,
+      maxLatenessMs: maxLatenessSeconds * 1_000,
+      loginAttempts,
+      loginTimeoutMs: loginTimeoutSeconds * 1_000,
+    });
+    const logPath = await writeParallelLog(result);
+    console.log(result.status === "confirmed"
+      ? "PARALLEL_CONFIRMED：两个时段均预约成功"
+      : result.mode === "dry-run"
+        ? "PARALLEL_READY：两个时段均已选中，未提交"
+        : "PARALLEL_AMBIGUOUS：双提交已结束，请检查结果");
+    console.log(`PARALLEL_LOG：${logPath}`);
+    console.log(JSON.stringify(result, null, 2));
+    if (result.status === "ambiguous") process.exitCode = 2;
   });
 
 program
@@ -245,6 +325,58 @@ program
       prepareMinutes,
     );
     console.log("SCHEDULED：优先级串行任务已安装");
+    console.log(JSON.stringify(scheduled, null, 2));
+  });
+
+program
+  .command("schedule-parallel")
+  .description("安装双 Edge 准点错峰提交的一次性任务")
+  .requiredOption("--date <YYYY-MM-DD>", "预约日期")
+  .requiredOption("--slot-a <HH:mm-HH:mm>", "Edge A 的时段")
+  .requiredOption("--slot-b <HH:mm-HH:mm>", "Edge B 的时段")
+  .requiredOption("--at <ISO-8601>", "A 的提交时刻，必须包含时区")
+  .option("--prepare-minutes <minutes>", "提前启动双路登录的分钟数", "2")
+  .option("--submit-delay-ms <milliseconds>", "B 相对 A 的提交延迟", "150")
+  .option("--simulation", "允许调度日期不等于正常资源释放日期")
+  .action(async (options: {
+    date: string;
+    slotA: string;
+    slotB: string;
+    at: string;
+    prepareMinutes: string;
+    submitDelayMs: string;
+    simulation?: boolean;
+  }) => {
+    const targetDate = validateDate(options.date);
+    const slotA = validateSlot(options.slotA);
+    const slotB = validateSlot(options.slotB);
+    if (slotA === slotB) throw new Error("双提交必须使用两个不同时段");
+    const at = parseTimestamp(options.at, "--at");
+    const prepareMinutes = Number(options.prepareMinutes);
+    const submitDelayMs = Number(options.submitDelayMs);
+    if (!Number.isInteger(prepareMinutes)) {
+      throw new Error("--prepare-minutes 必须是整数");
+    }
+    if (!Number.isInteger(submitDelayMs) || submitDelayMs < 0 || submitDelayMs > 10_000) {
+      throw new Error("--submit-delay-ms 必须是 0–10000 的整数");
+    }
+    const releaseDate = releaseDateFor(targetDate);
+    if (!options.simulation && shanghaiDate(at) !== releaseDate) {
+      throw new Error(
+        `目标日期 ${targetDate} 应在 ${releaseDate} 抢订；测试已开放日期时须显式使用 --simulation`,
+      );
+    }
+    const scheduled = await installParallelSchedule(
+      targetDate,
+      slotA,
+      slotB,
+      at,
+      prepareMinutes,
+      submitDelayMs,
+    );
+    console.log(options.simulation
+      ? "SCHEDULED_SIMULATION：双提交仿真任务已安装"
+      : "SCHEDULED：双提交正式任务已安装");
     console.log(JSON.stringify(scheduled, null, 2));
   });
 

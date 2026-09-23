@@ -106,9 +106,42 @@ courtscript schedule-priority --pair <id> \
 
 独立 profile、凭据元数据、计划、日志和截图全部位于 `.state/`，该目录不会进入 Git。
 
-## 双 Edge 并发实验
+## 双 Edge 正式双提交
 
-实验分支提供双进程验证命令，默认只选择、不提交：
+两个时段都要抢时，可以让两个隔离的普通 Edge 并发登录、同时刷新，并让 B 相对 A
+错峰 150 ms 各提交一次。先做不提交验证：
+
+```bash
+courtscript run-parallel --date 2026-09-24 \
+  --slot-a 08:00-09:00 --slot-b 09:00-10:00 \
+  --dry-run --seed-profile
+```
+
+正式安装一次性任务：
+
+```bash
+courtscript schedule-parallel --date 2026-09-25 \
+  --slot-a 20:00-21:00 --slot-b 21:00-22:30 \
+  --at 2026-09-23T07:00:00+08:00 \
+  --prepare-minutes 2 --submit-delay-ms 150
+```
+
+任务在 06:58 克隆已经验证的专用登录 profile，启动两个互相隔离的普通 Edge 并从
+eHall 完成登录。07:00 前不检查尚未释放的目标格；到点后两路同时刷新，分别确认精确
+日期、时段、“可预约”和可点击状态，再让 A 单次提交、B 延迟 150 ms 单次提交。任何
+一路都不会回退时段或自动重试预约请求。两笔请求结束后统一进入“我的预约”核验，结果
+写入权限为 `0600` 的 `.state/logs/parallel-*.json`。如果启动晚于目标时刻 120 秒，任务
+安全停止。一次性任务结束后自动卸载并删除自身 plist 与 runner。
+
+对已经开放的日期做定时全真测试时，须显式加 `--simulation`；正常正式预约会校验
+`--at` 的上海日期必须是目标日期前两天。
+
+与其他调度一样，`launchd` 不能唤醒已经睡眠的 Mac，正式使用前仍需设置 06:55 的
+`pmset wakeorpoweron` 或确保电脑保持唤醒并登录。
+
+## 双 Edge 并发实验命令
+
+保留底层实验命令用于诊断，默认只选择、不提交：
 
 ```bash
 courtscript parallel-feasibility --date 2026-09-24 \
