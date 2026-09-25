@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildParallelLanePlan,
   parallelSubmitStatus,
+  runIndependentLanePipelines,
 } from "../src/parallel-feasibility.js";
 
 describe("parallel lane isolation", () => {
@@ -21,6 +22,31 @@ describe("parallel lane isolation", () => {
     const plan = buildParallelLanePlan([false, true], 150);
     expect(plan[0].available).toBe(false);
     expect(plan[1]).toMatchObject({ available: true, submitDelayMs: 150 });
+  });
+
+  it("lets a ready lane submit without waiting for the other lane to load", async () => {
+    const events: string[] = [];
+    let releaseA: (() => void) | undefined;
+    const aStillLoading = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const running = runIndependentLanePipelines(
+      async () => {
+        events.push("A:loading");
+        await aStillLoading;
+        events.push("A:submit");
+      },
+      async () => {
+        events.push("B:ready");
+        events.push("B:submit");
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(events).toContain("B:submit");
+    expect(events).not.toContain("A:submit");
+    releaseA?.();
+    await running;
+    expect(events).toContain("A:submit");
   });
 
   it("confirms two independently verified submissions", () => {
