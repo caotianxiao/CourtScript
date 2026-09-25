@@ -256,14 +256,21 @@ program
       loginTimeoutMs: loginTimeoutSeconds * 1_000,
     });
     const logPath = await writeParallelLog(result);
-    console.log(result.status === "confirmed"
-      ? "PARALLEL_CONFIRMED：两个时段均预约成功"
-      : result.mode === "dry-run"
-        ? "PARALLEL_READY：两个时段均已选中，未提交"
-        : "PARALLEL_AMBIGUOUS：双提交已结束，请检查结果");
+    const resultMessage = result.mode === "dry-run"
+      ? "PARALLEL_READY：两个时段均已选中，未提交"
+      : result.status === "confirmed"
+        ? "PARALLEL_CONFIRMED：两个时段均预约成功"
+        : result.status === "partial"
+          ? "PARALLEL_PARTIAL：仅可预约的一路已完成预约"
+          : result.status === "failed"
+            ? "PARALLEL_FAILED：刷新后没有成功提交任何时段"
+            : "PARALLEL_AMBIGUOUS：双提交已结束，请检查结果";
+    console.log(resultMessage);
     console.log(`PARALLEL_LOG：${logPath}`);
     console.log(JSON.stringify(result, null, 2));
-    if (result.status === "ambiguous") process.exitCode = 2;
+    if (["partial", "failed", "ambiguous"].includes(result.status)) {
+      process.exitCode = 2;
+    }
   });
 
 program

@@ -179,6 +179,10 @@ interface BrowserProbe {
   webdriverExposed: boolean;
   selectedSlot: string;
   availability: string;
+  availableAfterRefresh: boolean;
+  selected: boolean;
+  submitted: boolean;
+  error?: string;
   refreshMs: number;
   selectionMs: number;
   launchRequests: number;
@@ -187,7 +191,7 @@ interface BrowserProbe {
 }
 
 export interface ParallelFeasibilityResult {
-  status: "feasible" | "confirmed" | "ambiguous";
+  status: "feasible" | "confirmed" | "partial" | "failed" | "ambiguous";
   mode: "dry-run" | "submit";
   controlMethod: "ordinary-edge-raw-cdp";
   targetDate: string;
@@ -199,8 +203,42 @@ export interface ParallelFeasibilityResult {
   requestedSubmitDelayMs?: number;
   submitStartSkewMs?: number;
   simultaneousSelectionsHeld: boolean;
+  availableAfterRefresh: [boolean, boolean];
+  selectedLanes: [boolean, boolean];
+  submittedLanes: [boolean, boolean];
   recordsFound?: [boolean, boolean];
   browsers: [BrowserProbe, BrowserProbe];
+}
+
+export interface ParallelLanePlan {
+  index: 0 | 1;
+  label: "A" | "B";
+  available: boolean;
+  submitDelayMs: number;
+}
+
+export function buildParallelLanePlan(
+  availableAfterRefresh: [boolean, boolean],
+  submitDelayMs: number,
+): [ParallelLanePlan, ParallelLanePlan] {
+  return [
+    { index: 0, label: "A", available: availableAfterRefresh[0], submitDelayMs: 0 },
+    { index: 1, label: "B", available: availableAfterRefresh[1], submitDelayMs },
+  ];
+}
+
+export function parallelSubmitStatus(
+  submittedLanes: [boolean, boolean],
+  recordsFound?: [boolean, boolean],
+): ParallelFeasibilityResult["status"] {
+  const submittedCount = submittedLanes.filter(Boolean).length;
+  if (submittedCount === 0) return "failed";
+  if (!recordsFound) return "ambiguous";
+  const confirmedCount = submittedLanes.filter((submitted, index) =>
+    submitted && Boolean(recordsFound[index])
+  ).length;
+  if (confirmedCount !== submittedCount) return "ambiguous";
+  return submittedCount === 2 ? "confirmed" : "partial";
 }
 
 async function freeLocalPort(): Promise<number> {
@@ -872,66 +910,148 @@ export async function runParallelFeasibility(options: {
       return state;
     }));
     console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：两个 Edge 已并发刷新`);
-    if (options.submit && (
-      !refreshedStates[0]?.availableSlots.includes(requestedSlots[0])
-      || !refreshedStates[1]?.availableSlots.includes(requestedSlots[1])
-    )) {
-      throw new Error(
-        `真实双提交只允许精确目标时段，刷新后状态：${JSON.stringify({
-          slotA: requestedSlots[0],
-          availableA: refreshedStates[0]?.availableSlots.includes(requestedSlots[0]),
-          slotB: requestedSlots[1],
-          availableB: refreshedStates[1]?.availableSlots.includes(requestedSlots[1]),
-        })}`,
-      );
+    const availableAfterRefresh: [boolean, boolean] = [
+      Boolean(refreshedStates[0]?.availableSlots.includes(testedSlots[0])),
+      Boolean(refreshedStates[1]?.availableSlots.includes(testedSlots[1])),
+    ];
+    const lanePlan = buildParallelLanePlan(
+      options.submit ? availableAfterRefresh : [true, true],
+      submitDelayMs,
+    );
+    console.log(
+      `[${new Date().toISOString()}] PARALLEL_PHASE：刷新后可预约状态 ${JSON.stringify(availableAfterRefresh)}`,
+    );
+
+    type SelectionResult = Awaited<ReturnType<typeof selectWithoutSubmitting>>;
+    const selections: [SelectionResult | undefined, SelectionResult | undefined] = [
+      undefined,
+      undefined,
+    ];
+    const laneErrors: [string | undefined, string | undefined] = [undefined, undefined];
+    const selectionAttempts = await Promise.allSettled([
+      lanePlan[0].available
+        ? selectWithoutSubmitting(browserA.page, targetDate, testedSlots[0])
+        : Promise.resolve(undefined),
+      lanePlan[1].available
+        ? selectWithoutSubmitting(browserB.page, targetDate, testedSlots[1])
+        : Promise.resolve(undefined),
+    ]);
+    for (const index of [0, 1] as const) {
+      const attempt = selectionAttempts[index];
+      if (attempt.status === "fulfilled") {
+        selections[index] = attempt.value;
+      } else {
+        laneErrors[index] = attempt.reason instanceof Error
+          ? attempt.reason.message
+          : String(attempt.reason);
+      }
     }
 
-    const selections = await Promise.all([
-      selectWithoutSubmitting(browserA.page, targetDate, testedSlots[0]),
-      selectWithoutSubmitting(browserB.page, targetDate, testedSlots[1]),
+    const heldSelections = await Promise.all([
+      selections[0]
+        ? browserA.page.evaluate(
+          ({ targetDate, slot }) => document.body.innerText
+            .replace(/\s+/g, " ").includes(`${targetDate} ${slot}`),
+          { targetDate, slot: testedSlots[0] },
+        ).catch(() => false)
+        : Promise.resolve(false),
+      selections[1]
+        ? browserB.page.evaluate(
+          ({ targetDate, slot }) => document.body.innerText
+            .replace(/\s+/g, " ").includes(`${targetDate} ${slot}`),
+          { targetDate, slot: testedSlots[1] },
+        ).catch(() => false)
+        : Promise.resolve(false),
     ]);
-    const simultaneousSelectionsHeld = Boolean(await browserA.page.evaluate(
-      ({ targetDate, slot }) => document.body.innerText
-        .replace(/\s+/g, " ").includes(`${targetDate} ${slot}`),
-      { targetDate, slot: testedSlots[0] },
-    )) && Boolean(await browserB.page.evaluate(
-      ({ targetDate, slot }) => document.body.innerText
-        .replace(/\s+/g, " ").includes(`${targetDate} ${slot}`),
-      { targetDate, slot: testedSlots[1] },
-    ));
-    if (!simultaneousSelectionsHeld || requestCounts.some((count) => count !== 0)) {
+    const selectedLanes: [boolean, boolean] = [
+      Boolean(selections[0] && heldSelections[0]),
+      Boolean(selections[1] && heldSelections[1]),
+    ];
+    for (const index of [0, 1] as const) {
+      if (selections[index] && !selectedLanes[index] && !laneErrors[index]) {
+        laneErrors[index] = "选择未能保持";
+      }
+    }
+    const simultaneousSelectionsHeld = selectedLanes.some(Boolean)
+      && selectedLanes.every((selected, index) =>
+        !lanePlan[index]?.available || selected
+      );
+    if (!options.submit && (
+      !simultaneousSelectionsHeld
+      || requestCounts.some((count) => count !== 0)
+    )) {
       throw new Error("并发选择未同时保持，或 dry-run 观测到提交请求");
     }
-    console.log(`[${new Date().toISOString()}] PARALLEL_PHASE：两个时段已同时选中`);
+    console.log(
+      `[${new Date().toISOString()}] PARALLEL_PHASE：已选中状态 ${JSON.stringify(selectedLanes)}`,
+    );
 
     let submitStartSkewMs: number | undefined;
     let recordsFound: [boolean, boolean] | undefined;
+    const submittedLanes: [boolean, boolean] = [false, false];
     if (options.submit) {
-      console.log(
-        `[${new Date().toISOString()}] PARALLEL_PHASE：双路各单次点击确认预约（B 延迟 ${submitDelayMs}ms）`,
-      );
-      const submitStarts = await Promise.all([
-        submitExactSelection(browserA.page, targetDate, testedSlots[0]),
-        (async () => {
-          if (submitDelayMs > 0) {
-            await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
-          }
-          return submitExactSelection(browserB.page, targetDate, testedSlots[1]);
-        })(),
-      ]);
-      submitStartSkewMs = Math.abs(submitStarts[0] - submitStarts[1]);
-      await new Promise((resolve) => setTimeout(resolve, 2_500));
-      if (requestCounts.some((count) => count > 1)) {
-        throw new Error(`预约提交请求次数异常：${requestCounts.join(",")}`);
+      const eligibleToSubmit: [boolean, boolean] = [
+        selectedLanes[0] && requestCounts[0] === 0,
+        selectedLanes[1] && requestCounts[1] === 0,
+      ];
+      for (const index of [0, 1] as const) {
+        if (selectedLanes[index] && !eligibleToSubmit[index] && !laneErrors[index]) {
+          laneErrors[index] = "选择阶段已经观察到提交请求，为避免重复提交已跳过";
+        }
       }
-      recordsFound = await verifyAppointmentSlots(
-        browserA.page,
-        targetDate,
-        testedSlots,
-      );
       console.log(
-        `[${new Date().toISOString()}] PARALLEL_PHASE：我的预约核验 ${JSON.stringify(recordsFound)}`,
+        `[${new Date().toISOString()}] PARALLEL_PHASE：独立提交状态 ${JSON.stringify(eligibleToSubmit)}（B 延迟 ${submitDelayMs}ms）`,
       );
+      const submitAttempts = await Promise.allSettled([
+        eligibleToSubmit[0]
+          ? submitExactSelection(browserA.page, targetDate, testedSlots[0])
+          : Promise.resolve(undefined),
+        eligibleToSubmit[1]
+          ? (async () => {
+            if (lanePlan[1].submitDelayMs > 0) {
+              await new Promise((resolve) => setTimeout(resolve, lanePlan[1].submitDelayMs));
+            }
+            return submitExactSelection(browserB.page, targetDate, testedSlots[1]);
+          })()
+          : Promise.resolve(undefined),
+      ]);
+      const submitStarts: [number | undefined, number | undefined] = [undefined, undefined];
+      for (const index of [0, 1] as const) {
+        const attempt = submitAttempts[index];
+        if (attempt.status === "fulfilled") {
+          submitStarts[index] = attempt.value;
+          submittedLanes[index] = attempt.value !== undefined;
+        } else {
+          laneErrors[index] = attempt.reason instanceof Error
+            ? attempt.reason.message
+            : String(attempt.reason);
+        }
+      }
+      if (submitStarts[0] !== undefined && submitStarts[1] !== undefined) {
+        submitStartSkewMs = Math.abs(submitStarts[0] - submitStarts[1]);
+      }
+      if (submittedLanes.some(Boolean)) {
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+        for (const index of [0, 1] as const) {
+          if ((requestCounts[index] ?? 0) > 1) {
+            laneErrors[index] = `预约提交请求次数异常：${requestCounts[index]}`;
+            submittedLanes[index] = false;
+          }
+        }
+        const verificationPage = submittedLanes[0] ? browserA.page : browserB.page;
+        const found = await verifyAppointmentSlots(
+          verificationPage,
+          targetDate,
+          testedSlots,
+        );
+        recordsFound = [
+          submittedLanes[0] && found[0],
+          submittedLanes[1] && found[1],
+        ];
+        console.log(
+          `[${new Date().toISOString()}] PARALLEL_PHASE：我的预约核验 ${JSON.stringify(recordsFound)}`,
+        );
+      }
     }
 
     const probes: [BrowserProbe, BrowserProbe] = [browserA, browserB].map(
@@ -944,7 +1064,12 @@ export async function runParallelFeasibility(options: {
         fudanCookieCount: instance.fudanCookieCount,
         webdriverExposed: instance.webdriverExposed,
         selectedSlot: testedSlots[index] ?? "",
-        availability: selections[index]?.availability ?? "",
+        availability: selections[index]?.availability
+          ?? (availableAfterRefresh[index] ? "刷新后可预约" : "刷新后不可预约"),
+        availableAfterRefresh: availableAfterRefresh[index] ?? false,
+        selected: selectedLanes[index] ?? false,
+        submitted: submittedLanes[index] ?? false,
+        error: laneErrors[index],
         refreshMs: refreshDurations[index] ?? 0,
         selectionMs: selections[index]?.selectionMs ?? 0,
         launchRequests: requestCounts[index] ?? 0,
@@ -954,7 +1079,7 @@ export async function runParallelFeasibility(options: {
     ) as [BrowserProbe, BrowserProbe];
     return {
       status: options.submit
-        ? (recordsFound?.every(Boolean) ? "confirmed" : "ambiguous")
+        ? parallelSubmitStatus(submittedLanes, recordsFound)
         : "feasible",
       mode: options.submit ? "submit" : "dry-run",
       controlMethod: "ordinary-edge-raw-cdp",
@@ -969,6 +1094,9 @@ export async function runParallelFeasibility(options: {
       requestedSubmitDelayMs: options.submit ? submitDelayMs : undefined,
       submitStartSkewMs,
       simultaneousSelectionsHeld,
+      availableAfterRefresh,
+      selectedLanes,
+      submittedLanes,
       recordsFound,
       browsers: probes,
     };
