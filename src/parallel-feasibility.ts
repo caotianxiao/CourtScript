@@ -13,6 +13,10 @@ import {
 import { loadStoredCredentials, type StoredCredentials } from "./credentials.js";
 import { EHALL_URL, SPECIAL_URL } from "./selenium-browser.js";
 import { validateDate, validateSlot } from "./validation.js";
+import {
+  decideWeekNavigation,
+  type WeekNavigationSnapshot,
+} from "./week-navigation.js";
 
 const EXPERIMENT_ROOT = join(STATE_DIR, "parallel-feasibility");
 const PAGE_TIMEOUT = 75_000;
@@ -553,6 +557,122 @@ function gridStateScript(targetDate: string): string {
   })()`;
 }
 
+async function readWeekNavigationSnapshot(
+  page: RawCdpPage,
+): Promise<WeekNavigationSnapshot> {
+  return page.evaluate(() => {
+    const start = document.querySelector<HTMLInputElement>(
+      'input[placeholder="开始日期"]',
+    );
+    const end = document.querySelector<HTMLInputElement>(
+      'input[placeholder="结束日期"]',
+    );
+    const visibleDates = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        ".reservation_data .week_header span",
+      ),
+    ).map((item) => item.innerText.trim())
+      .filter((text) => /^\d{4}-\d{2}-\d{2}$/.test(text));
+    return {
+      start: start?.value.trim() ?? "",
+      end: end?.value.trim() ?? "",
+      visibleDates,
+    };
+  });
+}
+
+async function reloadAndWaitForNewDocument(page: RawCdpPage): Promise<void> {
+  const marker = `${Date.now()}-${Math.random()}`;
+  await page.evaluate((value) => {
+    const markedWindow = window as Window & { __courtScriptReloadMarker?: string };
+    markedWindow.__courtScriptReloadMarker = value;
+    return true;
+  }, marker);
+  await page.reload();
+  const deadline = Date.now() + GRID_TIMEOUT;
+  while (Date.now() < deadline) {
+    const replaced = await page.evaluate((value) => {
+      const markedWindow = window as Window & { __courtScriptReloadMarker?: string };
+      return markedWindow.__courtScriptReloadMarker !== value
+        && document.readyState !== "loading";
+    }, marker).catch(() => false);
+    if (replaced) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("刷新后等待新文档替换超时");
+}
+
+async function waitForActionableWeekSnapshot(
+  page: RawCdpPage,
+  targetDate: string,
+): Promise<WeekNavigationSnapshot> {
+  const deadline = Date.now() + GRID_TIMEOUT;
+  let lastSnapshot: WeekNavigationSnapshot | undefined;
+  while (Date.now() < deadline) {
+    lastSnapshot = await readWeekNavigationSnapshot(page).catch(() => undefined);
+    if (
+      lastSnapshot
+      && decideWeekNavigation(targetDate, lastSnapshot) !== "wait"
+    ) {
+      return lastSnapshot;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(
+    `等待目标日期列 ${targetDate} 超时：${JSON.stringify(lastSnapshot ?? {})}`,
+  );
+}
+
+async function waitForWeekChange(
+  page: RawCdpPage,
+  previous: WeekNavigationSnapshot,
+  label: "前一周" | "后一周",
+): Promise<void> {
+  const deadline = Date.now() + GRID_TIMEOUT;
+  while (Date.now() < deadline) {
+    const current = await readWeekNavigationSnapshot(page).catch(() => undefined);
+    if (
+      current
+      && (
+        current.start !== previous.start
+        || current.end !== previous.end
+        || current.visibleDates.join(",") !== previous.visibleDates.join(",")
+      )
+    ) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`切换${label}超时`);
+}
+
+async function moveRawPageToTargetWeek(
+  page: RawCdpPage,
+  targetDate: string,
+  edgeLabel: "A" | "B",
+): Promise<void> {
+  for (let step = 0; step < 110; step += 1) {
+    const snapshot = await waitForActionableWeekSnapshot(page, targetDate);
+    const decision = decideWeekNavigation(targetDate, snapshot);
+    if (decision === "visible") return;
+    if (decision === "wait") continue;
+    const clicked = await page.evaluate((label) => {
+      const candidates = Array.from(
+        document.querySelectorAll<HTMLElement>("button,a,span,div"),
+      ).filter((item) => item.innerText?.trim() === label)
+        .sort((left, right) => left.children.length - right.children.length);
+      const control = candidates[0];
+      if (!control) return false;
+      control.click();
+      return true;
+    }, decision);
+    if (!clicked) throw new Error(`页面缺少“${decision}”控件`);
+    console.log(
+      `[${new Date().toISOString()}] PARALLEL_PHASE：Edge ${edgeLabel} 点击${decision}，查找 ${targetDate}`,
+    );
+    await waitForWeekChange(page, snapshot, decision);
+  }
+  throw new Error(`无法导航到目标日期：${targetDate}`);
+}
+
 async function waitForGrid(page: RawCdpPage, targetDate: string): Promise<GridState> {
   const deadline = Date.now() + GRID_TIMEOUT;
   let lastState: GridState | undefined;
@@ -841,8 +961,14 @@ export async function runParallelFeasibility(options: {
     let testedSlots = requestedSlots;
     if (!options.submit) {
       const [initialA, initialB] = await Promise.all([
-        waitForGrid(browserA.page, targetDate),
-        waitForGrid(browserB.page, targetDate),
+        (async () => {
+          await moveRawPageToTargetWeek(browserA.page, targetDate, "A");
+          return waitForGrid(browserA.page, targetDate);
+        })(),
+        (async () => {
+          await moveRawPageToTargetWeek(browserB.page, targetDate, "B");
+          return waitForGrid(browserB.page, targetDate);
+        })(),
       ]);
       testedSlots = chooseTestSlots(requestedSlots, initialA, initialB);
     }
@@ -926,9 +1052,14 @@ export async function runParallelFeasibility(options: {
       const plan = lanePlan[index];
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, releaseAt - Date.now())));
       refreshStarts[index] = Date.now();
-      await instance.page.reload().catch(() => undefined);
-      const refreshedState = await waitForGrid(instance.page, targetDate);
-      refreshDurations[index] = Date.now() - refreshStarts[index];
+      let refreshedState: GridState;
+      try {
+        await reloadAndWaitForNewDocument(instance.page);
+        await moveRawPageToTargetWeek(instance.page, targetDate, plan.label);
+        refreshedState = await waitForGrid(instance.page, targetDate);
+      } finally {
+        refreshDurations[index] = Date.now() - refreshStarts[index];
+      }
       availableAfterRefresh[index] = refreshedState.availableSlots.includes(slot);
       console.log(
         `[${new Date().toISOString()}] PARALLEL_PHASE：Edge ${plan.label} 刷新完成（${refreshDurations[index]}ms），目标可预约=${availableAfterRefresh[index]}`,
@@ -972,7 +1103,7 @@ export async function runParallelFeasibility(options: {
       }
     }
     console.log(
-      `[${new Date().toISOString()}] PARALLEL_PHASE：双路独立流程结束，可预约=${JSON.stringify(availableAfterRefresh)}，已选中=${JSON.stringify(selectedLanes)}，已提交=${JSON.stringify(submittedLanes)}`,
+      `[${new Date().toISOString()}] PARALLEL_PHASE：双路独立流程结束，可预约=${JSON.stringify(availableAfterRefresh)}，已选中=${JSON.stringify(selectedLanes)}，已提交=${JSON.stringify(submittedLanes)}，错误=${JSON.stringify(laneErrors)}`,
     );
     const simultaneousSelectionsHeld = selectedLanes.some(Boolean)
       && selectedLanes.every((selected, index) =>

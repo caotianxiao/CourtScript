@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideWeekNavigation } from "../src/reservation.js";
+import { decideWeekNavigation } from "../src/week-navigation.js";
 
 describe("week navigation", () => {
   it("trusts a rendered target column even while range inputs are empty", () => {

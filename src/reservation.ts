@@ -16,6 +16,12 @@ import type {
   RunMode,
 } from "./types.js";
 import { addCalendarDays, shanghaiDate } from "./validation.js";
+import {
+  decideWeekNavigation,
+  type WeekNavigationSnapshot,
+} from "./week-navigation.js";
+
+export { decideWeekNavigation } from "./week-navigation.js";
 
 const PAGE_TIMEOUT = 30_000;
 
@@ -76,40 +82,6 @@ export async function reloadReservationTable(): Promise<void> {
     PAGE_TIMEOUT,
     "预约资源刷新",
   );
-}
-
-interface WeekNavigationSnapshot {
-  start: string;
-  end: string;
-  visibleDates: string[];
-}
-
-export type WeekNavigationDecision = "visible" | "wait" | "前一周" | "后一周";
-
-export function decideWeekNavigation(
-  targetDate: string,
-  snapshot: WeekNavigationSnapshot,
-): WeekNavigationDecision {
-  // The rendered date columns are the authoritative state.  In particular,
-  // they can be ready before the date-range inputs finish hydrating after a
-  // reload, so a visible target must never trigger week navigation.
-  if (snapshot.visibleDates.includes(targetDate)) {
-    return "visible";
-  }
-  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
-  if (
-    !datePattern.test(snapshot.start)
-    || !datePattern.test(snapshot.end)
-    || snapshot.start > snapshot.end
-  ) {
-    return "wait";
-  }
-  // If the inputs say that the target belongs to this week but its column is
-  // not rendered yet, keep waiting instead of clicking a navigation control.
-  if (targetDate >= snapshot.start && targetDate <= snapshot.end) {
-    return "wait";
-  }
-  return targetDate < snapshot.start ? "前一周" : "后一周";
 }
 
 const WEEK_NAVIGATION_STATE_SCRIPT = `(() => {
