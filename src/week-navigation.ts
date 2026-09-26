@@ -6,6 +6,8 @@ export interface WeekNavigationSnapshot {
 
 export type WeekNavigationDecision = "visible" | "wait" | "前一周" | "后一周";
 
+export type ReleaseLoadStrategy = "reload" | "navigate-at-release";
+
 export function decideWeekNavigation(
   targetDate: string,
   snapshot: WeekNavigationSnapshot,
@@ -27,4 +29,13 @@ export function decideWeekNavigation(
     return "wait";
   }
   return targetDate < snapshot.start ? "前一周" : "后一周";
+}
+
+export function decideReleaseLoadStrategy(
+  decision: WeekNavigationDecision,
+): ReleaseLoadStrategy {
+  // A full reload resets the booking app to the current week. If the target is
+  // in a later week, waiting there and clicking "后一周" at release avoids
+  // loading the current week first and the target week second.
+  return decision === "后一周" ? "navigate-at-release" : "reload";
 }

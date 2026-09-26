@@ -17,6 +17,7 @@ import type {
 } from "./types.js";
 import { addCalendarDays, shanghaiDate } from "./validation.js";
 import {
+  decideReleaseLoadStrategy,
   decideWeekNavigation,
   type WeekNavigationSnapshot,
 } from "./week-navigation.js";
@@ -97,6 +98,18 @@ const WEEK_NAVIGATION_STATE_SCRIPT = `(() => {
     visibleDates,
   });
 })()`;
+
+async function currentWeekNavigationDecision(
+  targetDate: string,
+): Promise<ReturnType<typeof decideWeekNavigation>> {
+  const snapshot = await waitForCourtJavaScript<WeekNavigationSnapshot>(
+    WEEK_NAVIGATION_STATE_SCRIPT,
+    (value) => decideWeekNavigation(targetDate, value) !== "wait",
+    PAGE_TIMEOUT,
+    `等待目标日期范围 ${targetDate}`,
+  );
+  return decideWeekNavigation(targetDate, snapshot);
+}
 
 async function moveToTargetWeek(targetDate: string): Promise<void> {
   for (let step = 0; step < 110; step += 1) {
@@ -555,15 +568,30 @@ export async function runReservation(
   try {
     normalEdgeStarted = true;
     await openAuthenticatedReservationPage();
-    await moveToTargetWeek(plan.targetDate);
+    const initialWeekDecision = await currentWeekNavigationDecision(plan.targetDate);
+    const releaseLoadStrategy = options.notBefore
+      ? decideReleaseLoadStrategy(initialWeekDecision)
+      : "reload";
+    if (!options.notBefore || releaseLoadStrategy === "reload") {
+      await moveToTargetWeek(plan.targetDate);
+    }
     if (options.notBefore) {
       console.log(
-        `[${new Date().toISOString()}] RUN_PHASE：页面预热完成，等待 ${options.notBefore.toISOString()}`,
+        releaseLoadStrategy === "navigate-at-release"
+          ? `[${new Date().toISOString()}] RUN_PHASE：页面预热完成，目标在下一周，整点切换目标周；等待 ${options.notBefore.toISOString()}`
+          : `[${new Date().toISOString()}] RUN_PHASE：页面预热完成，整点刷新当前周；等待 ${options.notBefore.toISOString()}`,
       );
       await waitUntilRelease(options.notBefore, maxLatenessMs);
-      console.log(`[${new Date().toISOString()}] RUN_PHASE：开放时刻已到，刷新预约资源`);
-      await reloadReservationTable();
-      await moveToTargetWeek(plan.targetDate);
+      if (releaseLoadStrategy === "navigate-at-release") {
+        console.log(
+          `[${new Date().toISOString()}] RUN_PHASE：开放时刻已到，切换到目标周并加载预约资源`,
+        );
+        await moveToTargetWeek(plan.targetDate);
+      } else {
+        console.log(`[${new Date().toISOString()}] RUN_PHASE：开放时刻已到，刷新预约资源`);
+        await reloadReservationTable();
+        await moveToTargetWeek(plan.targetDate);
+      }
     }
     await installLaunchMonitor();
     console.log(`[${new Date().toISOString()}] RUN_PHASE：按优先级选择目标时段`);

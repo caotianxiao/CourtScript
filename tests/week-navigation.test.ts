@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { decideWeekNavigation } from "../src/week-navigation.js";
+import {
+  decideReleaseLoadStrategy,
+  decideWeekNavigation,
+} from "../src/week-navigation.js";
 
 describe("week navigation", () => {
   it("trusts a rendered target column even while range inputs are empty", () => {
@@ -37,5 +40,11 @@ describe("week navigation", () => {
       end: "2026-09-27",
       visibleDates: [],
     })).toBe("后一周");
+  });
+
+  it("loads a later week by navigating once at release", () => {
+    expect(decideReleaseLoadStrategy("后一周")).toBe("navigate-at-release");
+    expect(decideReleaseLoadStrategy("visible")).toBe("reload");
+    expect(decideReleaseLoadStrategy("前一周")).toBe("reload");
   });
 });
