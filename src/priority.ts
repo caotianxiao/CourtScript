@@ -21,6 +21,19 @@ export interface PriorityRunOptions {
   deferVerification?: boolean;
 }
 
+export function lowPriorityRunOptions(
+  options: PriorityRunOptions,
+  nowMs = Date.now(),
+): PriorityRunOptions {
+  if (!options.notBefore || nowMs >= options.notBefore.getTime()) {
+    return {};
+  }
+  return {
+    notBefore: options.notBefore,
+    maxLatenessMs: options.maxLatenessMs,
+  };
+}
+
 function failedResult(
   plan: ReservationPlan,
   mode: RunMode,
@@ -123,11 +136,18 @@ export async function runPriorityPair(
     deferVerification: mode === "submit",
   });
 
+  const lowOptions = lowPriorityRunOptions(options);
   console.log(
-    `[${new Date().toISOString()}] PRIORITY_PHASE：高优先级结束（${high.status}），立即从 eHall 开始低优先级 ${pair.lowDate} ${pair.lowSlot}`,
+    lowOptions.notBefore
+      ? `[${new Date().toISOString()}] PRIORITY_PHASE：高优先级结束（${high.status}），从 eHall 预热低优先级并保持 ${lowOptions.notBefore.toISOString()} 屏障 ${pair.lowDate} ${pair.lowSlot}`
+      : `[${new Date().toISOString()}] PRIORITY_PHASE：高优先级结束（${high.status}），立即从 eHall 开始低优先级 ${pair.lowDate} ${pair.lowSlot}`,
   );
-  const low = await runChild(pair.lowPlanId, mode, {});
-  if (mode === "submit" && high.status === "submitted") {
+  const low = await runChild(pair.lowPlanId, mode, lowOptions);
+  if (
+    mode === "submit"
+    && high.selectedSlot
+    && (high.status === "submitted" || high.status === "ambiguous")
+  ) {
     console.log(
       `[${new Date().toISOString()}] PRIORITY_PHASE：两个抢场动作均已结束，补做高优先级核验`,
     );

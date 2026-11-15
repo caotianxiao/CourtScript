@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { priorityResultStatus } from "../src/priority.js";
+import {
+  lowPriorityRunOptions,
+  priorityResultStatus,
+} from "../src/priority.js";
 import type { ReservationResult, RunMode } from "../src/types.js";
 
 function result(
@@ -45,5 +48,23 @@ describe("priority pair status", () => {
       result("ready", "dry-run"),
       "dry-run",
     )).toBe("ready");
+  });
+});
+
+describe("low-priority release barrier", () => {
+  const notBefore = new Date("2026-10-20T07:00:00+08:00");
+
+  it("inherits the release barrier when high priority ends early", () => {
+    expect(lowPriorityRunOptions(
+      { notBefore, maxLatenessMs: 120_000 },
+      new Date("2026-10-20T06:57:14+08:00").getTime(),
+    )).toEqual({ notBefore, maxLatenessMs: 120_000 });
+  });
+
+  it("runs immediately after the release time", () => {
+    expect(lowPriorityRunOptions(
+      { notBefore, maxLatenessMs: 120_000 },
+      new Date("2026-10-20T07:00:04+08:00").getTime(),
+    )).toEqual({});
   });
 });

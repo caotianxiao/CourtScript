@@ -48,6 +48,96 @@ export interface OneShotSchedule {
   logPath: string;
 }
 
+export interface HardwareWakeSchedule {
+  wakeAt: string;
+  reused: boolean;
+}
+
+interface ShanghaiDateTimeParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}
+
+function shanghaiDateTimeParts(date: Date): ShanghaiDateTimeParts {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "numeric",
+    second: "numeric",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => Number(
+    parts.find((part) => part.type === type)?.value,
+  );
+  return {
+    year: value("year"),
+    month: value("month"),
+    day: value("day"),
+    hour: value("hour"),
+    minute: value("minute"),
+    second: value("second"),
+  };
+}
+
+function twoDigits(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+export function hardwareWakeAt(at: Date, minutesBefore: number): Date {
+  if (!Number.isInteger(minutesBefore) || minutesBefore < 1 || minutesBefore > 30) {
+    throw new Error("--wake-minutes-before 必须是 1–30 的整数");
+  }
+  return new Date(at.getTime() - minutesBefore * 60_000);
+}
+
+export function pmsetDate(wakeAt: Date, fourDigitYear = false): string {
+  const parts = shanghaiDateTimeParts(wakeAt);
+  const year = fourDigitYear ? String(parts.year) : twoDigits(parts.year % 100);
+  return [
+    `${twoDigits(parts.month)}/${twoDigits(parts.day)}/${year}`,
+    `${twoDigits(parts.hour)}:${twoDigits(parts.minute)}:${twoDigits(parts.second)}`,
+  ].join(" ");
+}
+
+function appleScriptString(value: string): string {
+  return `"${value
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n")}"`;
+}
+
+export async function installHardwareWake(wakeAt: Date): Promise<HardwareWakeSchedule> {
+  if (wakeAt.getTime() <= Date.now()) {
+    throw new Error("硬件唤醒时间已经过去，未创建调度任务");
+  }
+  const commandDate = pmsetDate(wakeAt);
+  const displayedDate = pmsetDate(wakeAt, true);
+  const { stdout: existing } = await execFileAsync("/usr/bin/pmset", ["-g", "sched"]);
+  const expected = `wakeorpoweron at ${displayedDate}`;
+  if (existing.includes(expected)) {
+    return { wakeAt: wakeAt.toISOString(), reused: true };
+  }
+
+  const shellCommand = `/usr/bin/pmset schedule wakeorpoweron "${commandDate}"`;
+  await execFileAsync("/usr/bin/osascript", [
+    "-e",
+    `do shell script ${appleScriptString(shellCommand)} with administrator privileges`,
+  ]);
+  const { stdout: installed } = await execFileAsync("/usr/bin/pmset", ["-g", "sched"]);
+  if (!installed.includes(expected)) {
+    throw new Error(`未能从 pmset 回读硬件唤醒事件：${displayedDate}`);
+  }
+  return { wakeAt: wakeAt.toISOString(), reused: false };
+}
+
 async function installSchedule(
   labelSuffix: string,
   cliArguments: string[],

@@ -1,171 +1,324 @@
 # CourtScript
 
-复旦大学新场馆预约系统的本地预约脚本。脚本只处理主资源 `1055`，按参数给出的首选、备选时段顺序尝试，不选择或猜测具体场号。
+CourtScript 是用于复旦大学新版体育场馆预约系统的 macOS 本地脚本。目前固定预约羽毛球主资源 `1055`，使用普通 Microsoft Edge、eHall 和统一身份认证完成登录，不选择、推断或随机分配具体场号。
 
-## 初始化
+本仓库的正式流程是“双优先级串行预约”：07:00 准点先提交高优先级时段；高优先级请求完成或明确失败后，立即重新从 eHall 进入并提交低优先级时段。两个时段是两个独立预约，不是普通计划中的备选时段。
+
+> 脚本会真实提交学校预约请求。首次换机部署必须先完成登录测试和 dry-run。网站出现验证码、滑块、登录失效或页面结构变化时，脚本会停止，不会绕过验证，也不会盲目重复提交。
+
+## 1. 运行环境
+
+必须满足：
+
+- macOS，保持用户账户处于已登录状态；
+- Microsoft Edge 安装在 `/Applications/Microsoft Edge.app`；
+- Node.js 22 或更高版本；
+- Git、npm，以及 macOS 自带的 `osascript`、`security`、`sqlite3`、`pmset`、`launchctl` 和 `caffeinate`；
+- 系统时区设为“亚洲/上海”，日期与时间自动同步；
+- 正式预约时 Mac 接通电源、保持开盖，只进入睡眠，不关机、不重启、不注销。
+
+检查基础环境：
 
 ```bash
-cd /Users/caotianxiao/CourtScript
-npm install
-npm run build
-npm link
-courtscript auth save-credentials
+node --version
+npm --version
+git --version
+test -x "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" && echo "Edge OK"
 ```
 
-账号只保存在权限为 `0600` 的 `.state/credentials.json` 中；密码由 macOS 钥匙串保存，服务名为 `CourtScript Fudan eHall`。重新保存凭据会覆盖旧值：
+如果没有 Node.js，可先安装 Homebrew，再运行 `brew install node@22`；也可以使用 Node.js 官方安装包。安装后需确认 `node --version` 至少为 `v22`。
+
+## 2. 下载和安装
+
+```bash
+git clone https://github.com/caotianxiao/CourtScript.git
+cd CourtScript
+npm ci
+npm run typecheck
+npm test
+npm run build
+npm link
+courtscript --help
+```
+
+`npm link` 会把 `courtscript` 命令链接到当前仓库。脚本会自动确定仓库根目录，因此安装后可以在任意目录执行命令。更新代码时运行：
+
+```bash
+cd CourtScript
+git pull
+npm ci
+npm run build
+npm link
+```
+
+`dist/` 不上传 GitHub，换机后必须执行一次 `npm run build`。
+
+## 3. macOS 权限与 Edge 初始化
+
+第一次运行时，macOS 可能询问终端是否允许控制 Microsoft Edge。选择“允许”。也可以在下面的位置检查：
+
+1. 打开“系统设置 → 隐私与安全性 → 自动化”；
+2. 找到正在使用的终端（Terminal、iTerm 等）；
+3. 允许它控制 Microsoft Edge；
+4. dry-run 需要保存截图时，再在“屏幕与系统音频录制”中允许该终端。
+
+CourtScript 会在仓库的 `.state/edge-profile/` 创建专用 Edge profile，并自动为该 profile 启用 `allow_javascript_apple_events`。不要把这个 profile 当作日常浏览器使用，也不要同时手动打开它。
+
+建议先录入凭据，再让脚本从 eHall 完成首次登录：
 
 ```bash
 courtscript auth save-credentials
+courtscript auth login
+courtscript auth check
+```
+
+`auth save-credentials` 会弹出两个系统对话框：
+
+- 账号仅写入 `.state/credentials.json`，文件权限为 `0600`；
+- 密码写入 macOS 钥匙串，服务名为 `CourtScript Fudan eHall`；
+- 密码不会写入源码、日志或 GitHub。
+
+密码变更后重新运行 `courtscript auth save-credentials` 即可覆盖。删除本机凭据：
+
+```bash
 courtscript auth clear-credentials
 ```
 
-## 创建与检查计划
+如果希望迁移日常 Edge 中已有的复旦登录态，可改用下面的初始化方式。运行前必须正常退出全部 Edge 窗口，而且日常 Edge 的活跃 profile 必须是 `Default`：
 
 ```bash
-courtscript plan add --date 2026-09-21 --slot 08:00-09:00 \
-  --fallback 09:00-10:00 --fallback 12:00-13:00
-courtscript plan list
+courtscript auth import-edge
+courtscript auth check
 ```
 
-`.state/plans.json` 保存计划、按优先级排列的时段、尝试记录和最终结果。
+`auth import-edge` 只保留 `fudan.edu.cn` 域名的 Cookie 和站点存储，临时完整副本会被删除。专用 profile 已存在时不要再次导入，直接使用 `auth login` 或 `auth check`。
 
-### 两个时段分别预约
+## 4. 睡眠、亮屏和自动唤醒设置
 
-如果两个时段都要预约、但必须优先抢其中一个，创建串行优先级计划：
+正式任务默认在 06:55 安装一次性硬件唤醒、06:57 启动登录、07:00 提交。06:55–06:57 之间任务尚未启动，必须让系统闲置休眠时间长于这段空窗。
+
+推荐在接通电源时设置为 15 分钟关闭屏幕、20 分钟系统休眠：
 
 ```bash
-courtscript plan add-priority --date 2026-09-23 \
-  --high-slot 20:00-21:00 --low-slot 08:00-09:00
+sudo pmset -c displaysleep 15 sleep 20
+pmset -g custom
 ```
 
-两个优先级也可以使用不同日期：
+`displaysleep` 必须小于 `sleep`，否则 macOS 会显示 “Display sleep should have a lower timeout than system sleep” 警告。不要把接电模式的 `sleep` 设成 1 分钟。若也希望电池模式安全，可单独设置：
+
+```bash
+sudo pmset -b displaysleep 5 sleep 10
+```
+
+正式预约仍建议全程接通电源。06:57 任务启动后会通过 `caffeinate -dimsu` 持续阻止系统、显示器、磁盘和网络进入休眠，直到两次预约结束。
+
+`schedule-priority` 默认自动执行一次：
+
+```text
+pmset schedule wakeorpoweron "MM/DD/YY 06:55:00"
+```
+
+macOS 会弹出管理员授权窗口，但管理员密码只交给系统授权对话框，CourtScript 不读取或保存。安装后可核对：
+
+```bash
+pmset -g sched
+```
+
+必须看到目标日期的 `wakeorpoweron`。硬件唤醒不能替代用户登录，因此正式任务前还要满足：
+
+- Mac 处于睡眠状态，而不是关机或停在 FileVault 登录界面；
+- 用户账户没有注销；锁屏可以，但建议不要启用闲置后自动注销；
+- MacBook 保持开盖并接通电源；
+- 不要在任务前拔掉电源，因为电池模式可能使用不同的休眠时间。
+
+## 5. 首次 dry-run
+
+用一个已经开放且仍有余量的日期建立测试计划：
 
 ```bash
 courtscript plan add-priority \
-  --high-date 2026-09-23 --high-slot 08:00-09:00 \
-  --low-date 2026-09-22 --low-slot 08:00-09:00
+  --date 2026-11-19 \
+  --high-slot 21:00-22:30 \
+  --low-slot 20:00-21:00
 ```
 
-这与普通计划的 `--fallback` 不同：`--fallback` 最多成功预约一个时段；串行优先级计划会先独立提交高优先级时段，高优先级成功或失败后，再从 eHall 重新开始并独立提交低优先级时段。
-
-## 运行
-
-先执行 dry-run：
+命令会输出一个八位 `id`，它是后续使用的 `<pair-id>`。执行不提交测试：
 
 ```bash
-courtscript run --plan <id> --dry-run
+courtscript run-priority --pair <pair-id> --dry-run
 ```
 
-dry-run 会从 eHall 登录，以同一独立 profile 打开普通 Edge，选择目标格并二次核验日期、时段和预填手机号，在“确认预约”前停止。成功时输出 `READY_TO_SUBMIT`，保存权限为 `0600` 的日志与截图，确认预约接口调用数必须为 `0`，随后刷新页面清除选择。
+dry-run 会依次完成登录、日期定位、时段选择和预约信息核验，在“确认预约”前停止。请求监控必须确认真实 `/site/resource/launch` 请求数为 0。截图和脱敏日志保存在 `.state/screenshots/` 与 `.state/logs/`。
 
-只有在现场确认计划、日期和时段无误后才运行：
+只有 dry-run 成功，并确认日期、两个时段和手机号预填信息正确后，才设置正式任务。
+
+## 6. 正式双优先级预约
+
+学校通常在目标日期前两天的北京时间 07:00 释放资源。例如要在 2026-11-19 预约，正式提交时刻应为 2026-11-17 07:00：
 
 ```bash
-courtscript run --plan <id> --submit
+courtscript plan add-priority \
+  --date 2026-11-19 \
+  --high-slot 21:00-22:30 \
+  --low-slot 20:00-21:00
+
+courtscript schedule-priority \
+  --pair <pair-id> \
+  --at 2026-11-17T07:00:00+08:00 \
+  --prepare-minutes 3 \
+  --wake-minutes-before 5
 ```
 
-submit 模式不截图，核验完日期和时段后立即点击一次“确认预约”，并监控 `/reservation/site/resource/launch`；新页面若使用其他请求通道，会转到“我的预约”核验结果。结果不明确时停止，绝不盲目重试。
+必须在 06:55 之前安装任务。`--at` 必须包含 `+08:00`，脚本还会校验调度日期是否确实是高优先级目标日期的前两天。
 
-## 一次性准点预约
+默认执行顺序：
 
-先创建计划，再安装一次性任务：
+1. 06:55 通过 `pmset` 唤醒 Mac；
+2. 06:57 LaunchAgent 启动，`caffeinate` 接管防休眠，并从 eHall 登录、预热资源页；
+3. 07:00:00 刷新资源表，重新查找目标日期列和高优先级时段，只点击一次“确认预约”；
+4. 保持当前 Edge 存活直到提交请求取得完整响应；已观察到 pending 请求时最长等待 60 秒，不会提前关闭浏览器；
+5. 不在两个优先级之间进入“我的预约”核验，直接关闭本轮窗口并从 eHall 开始低优先级；
+6. 如果高优先级异常地在 07:00 前结束，低优先级继承同一个 07:00 时间屏障；如果已经过 07:00，则立即执行；
+7. 两个抢场动作结束后，才补做高优先级的“我的预约”核验并写入最终结果。
+
+正式 submit 模式不截图。每个时段最多发送一次预约请求；请求已经发出但结果不明确时，脚本会标记为 `ambiguous` 并禁止自动重试。
+
+如果电脑确定整晚不会睡眠，可以显式加 `--no-wake`，否则不要使用该选项。
+
+## 7. 检查任务与结果
+
+安装成功后，命令会输出 LaunchAgent 标签和绝对日志路径。也可以检查：
 
 ```bash
-courtscript plan add --date 2026-09-23 --slot 20:00-21:00
-courtscript schedule-once --plan <id> \
-  --at 2026-09-21T07:00:00+08:00 --prepare-minutes 5
+courtscript plan list
+pmset -g sched
+launchctl print "gui/$(id -u)/cn.edu.fudan.courtscript.priority.<pair-id>"
 ```
 
-任务在 06:55 启动普通独立 Edge，从 eHall 完成预登录，并由 `caffeinate` 保持 Mac 和网络唤醒。到 07:00:00 后，Edge 刷新资源页、重新核验目标格并只点击一次“确认预约”。如果机器在指定时刻后超过 120 秒才恢复，任务会放弃，不会迟到补抢。任务结束后会删除自己的 LaunchAgent 文件并卸载。
-
-`launchd` 本身不能唤醒已经睡眠的 Mac。需要另行添加一次性 `pmset schedule wakeorpoweron` 事件，并确保届时仍处于已登录的用户会话；CourtScript 不会保存 Mac 管理员密码。
-
-## 两阶段优先级准点预约
-
-在 06:57 启动登录、07:00 先抢高优先级时段，随后立即预约低优先级时段：
+任务结束后查看日志：
 
 ```bash
-courtscript schedule-priority --pair <id> \
-  --at 2026-09-21T07:00:00+08:00 --prepare-minutes 3
+cat .state/scheduler/cn.edu.fudan.courtscript.priority.<pair-id>.log
+courtscript plan list
 ```
 
-执行顺序固定为：
+一次性 LaunchAgent 在运行结束后会删除自己的 plist 和 runner 并卸载，因此事后 `launchctl print` 找不到它是正常现象。计划、尝试记录和结果保存在 `.state/plans.json`。
 
-1. 06:57 从 eHall 登录并预热资源页；
-2. 07:00:00 刷新并只提交一次高优先级时段；
-3. 高优先级点击确认后仅保留 500ms 请求派发缓冲，不截图、不进入“我的预约”核验；
-4. 关闭该独立 Edge 流程，立即从 eHall 重新进入；
-5. 不再等待时间点，核验并只提交一次低优先级时段；
-6. 两个抢场动作结束后，再补做高优先级的“我的预约”核验。
+## 8. 普通首选/备选计划
 
-两个子计划分别保存结果。若某个子计划已成功，重新运行时会跳过它；若此前已经发出请求但结果不明确，也会禁止自动重试。原有的 `plan add`、`run` 和 `schedule-once` 行为不变。
-
-## 浏览器流程
-
-主流程从 `ehall.fudan.edu.cn` 开始，全程使用独立 profile 的普通 Microsoft Edge，并通过 Edge 内置的 Apple Events JavaScript 接口完成页面读取和点击。这样既避免预约站在 WebDriver 下出现空白页，也避免 eHall 登录按钮在 WebDriver 中失效。脚本只在 `id.fudan.edu.cn` 登录表单中填入保存的凭据；遇到验证码或滑块会停止，不会尝试绕过。
-
-独立 profile、凭据元数据、计划、日志和截图全部位于 `.state/`，该目录不会进入 Git。
-
-## 双 Edge 正式双提交
-
-两个时段都要抢时，可以让两个隔离的普通 Edge 并发登录、同时刷新，并让 B 相对 A
-错峰 150 ms 各提交一次。先做不提交验证：
+普通计划只会成功预约一个时段，按首选和备选顺序尝试：
 
 ```bash
-courtscript run-parallel --date 2026-09-24 \
-  --slot-a 08:00-09:00 --slot-b 09:00-10:00 \
+courtscript plan add \
+  --date 2026-11-19 \
+  --slot 21:00-22:30 \
+  --fallback 20:00-21:00
+
+courtscript run --plan <plan-id> --dry-run
+courtscript run --plan <plan-id> --submit
+```
+
+它与双优先级计划不同：`--fallback` 是“首选失败才改约备选”，最多得到一个预约；`add-priority` 会分别提交两个指定时段。
+
+## 9. 双 Edge 并发模式
+
+仓库同时保留两个隔离 Edge 错峰提交两个时段的实验/正式实现。建议先使用稳定的串行双优先级模式；确实需要并发时，先做 dry-run：
+
+```bash
+courtscript run-parallel \
+  --date 2026-11-19 \
+  --slot-a 20:00-21:00 \
+  --slot-b 21:00-22:30 \
   --dry-run --seed-profile
 ```
 
-正式安装一次性任务：
+正式调度示例：
 
 ```bash
-courtscript schedule-parallel --date 2026-09-25 \
-  --slot-a 20:00-21:00 --slot-b 21:00-22:30 \
-  --at 2026-09-23T07:00:00+08:00 \
-  --prepare-minutes 2 --submit-delay-ms 150
+courtscript schedule-parallel \
+  --date 2026-11-19 \
+  --slot-a 20:00-21:00 \
+  --slot-b 21:00-22:30 \
+  --at 2026-11-17T07:00:00+08:00 \
+  --prepare-minutes 2 \
+  --submit-delay-ms 150
 ```
 
-任务在 06:58 克隆已经验证的专用登录 profile，启动两个互相隔离的普通 Edge 并从
-eHall 完成登录。07:00 前不检查尚未释放的目标格；到点后两路同时刷新，分别确认精确
-日期、时段、“可预约”和可点击状态，再让 A 单次提交、B 延迟 150 ms 单次提交。任何
-一路都不会回退时段或自动重试预约请求。两笔请求结束后统一进入“我的预约”核验，结果
-写入权限为 `0600` 的 `.state/logs/parallel-*.json`。如果启动晚于目标时刻 120 秒，任务
-安全停止。一次性任务结束后自动卸载并删除自身 plist 与 runner。
+并发模式不会自动安装硬件唤醒，必须另行保证 Mac 已唤醒。实现约束和历史实验记录见 [`docs/parallel-first-priority-feasibility.md`](docs/parallel-first-priority-feasibility.md)。
 
-两路在刷新后独立判断、独立失败：若一个目标时段已经不可预约，另一个仍会继续选择并
-单次提交，不再因联动保护被放弃。日志中的 `availableAfterRefresh`、`selectedLanes` 和
-`submittedLanes` 分别记录两路状态；只成功一路时总状态为 `partial`。
+## 10. 常见问题
 
-刷新后的加载也完全独立：每个 Edge 在自己的预约表稳定后立即检查、选择并提交，不再
-等待另一边加载完成。A 选择后立即提交；B 仍在自己的选择完成后保留 150 ms 配置延迟，
-因此实际两笔提交间隔还会叠加两边页面加载速度的差异。
+### Apple Events 被拒绝
 
-若目标日期不在当前周，两个 Edge 会各自复用串行优先级脚本的日期范围判定并点击“前一周”
-或“后一周”，直到目标日期列出现。日期输入尚未加载或目标周列正在渲染时只等待，不会
-重复误点；翻页不会形成新的双路同步屏障。
-
-对已经开放的日期做定时全真测试时，须显式加 `--simulation`；正常正式预约会校验
-`--at` 的上海日期必须是目标日期前两天。
-
-与其他调度一样，`launchd` 不能唤醒已经睡眠的 Mac，正式使用前仍需设置 06:55 的
-`pmset wakeorpoweron` 或确保电脑保持唤醒并登录。
-
-## 双 Edge 并发实验命令
-
-保留底层实验命令用于诊断，默认只选择、不提交：
+先退出专用 Edge，再运行：
 
 ```bash
-courtscript parallel-feasibility --date 2026-09-24 \
-  --slot-a 08:00-09:00 --slot-b 09:00-10:00
+courtscript auth login
 ```
 
-命令会创建两套临时隔离 profile、启动两个普通 Edge 根进程、同时刷新并分别选中
-两个时段，要求两边的预约提交请求数均为零，然后关闭进程并删除临时 profile。
-只有在明确授权真实预约时才可附加 `--submit`；该模式严格使用两个指定时段，每路
-最多提交一次，不会回退到其他时段。`--submit-delay-ms 150` 可让 B 相对 A 错峰提交，
-`--seed-profile` 会从 CourtScript 专用登录 profile 创建两份仅用于本轮的临时副本。
-实测同毫秒双提交只成功一笔，150 ms 错峰已连续两轮成功两笔；正式使用仍需考虑
-07:00 高竞争环境与登录态稳定性。
-实测结论和正式并发版本的约束见
-[`docs/parallel-first-priority-feasibility.md`](docs/parallel-first-priority-feasibility.md)。
+留在电脑前接受 macOS 的“终端控制 Microsoft Edge”授权，然后重新执行 `auth check`。不要等到正式预约时才首次触发权限弹窗。
+
+### 统一身份认证失败
+
+重新录入账号密码：
+
+```bash
+courtscript auth save-credentials
+courtscript auth login
+```
+
+如果出现验证码或滑块，只能人工处理；脚本会安全停止。
+
+### 唤醒后又休眠
+
+检查当前是否接电，以及接电模式的 `sleep` 是否足够长：
+
+```bash
+pmset -g batt
+pmset -g custom
+pmset -g sched
+```
+
+推荐值是 `AC Power: displaysleep 15, sleep 20`。如果 `sleep` 仍是 1，06:55 唤醒后可能在 06:57 任务启动前再次休眠。
+
+### 找不到目标日期
+
+脚本会自动判断当前周、上一周或下一周并翻页。若学校改变“提前两天、07:00 开放”规则或预约页 DOM，先停止真实预约，重新执行 dry-run 并检查日志。
+
+### Edge 安装位置不同
+
+当前固定路径在 `src/constants.ts` 的 `EDGE_EXECUTABLE`。若 Edge 不在 `/Applications`，修改该常量后重新执行：
+
+```bash
+npm run build
+npm link
+```
+
+## 11. 数据与安全边界
+
+以下内容只保存在本机 `.state/`，并已被 `.gitignore` 排除：
+
+- 统一身份认证账号元数据；
+- 专用 Edge profile、Cookie 和站点存储；
+- 预约计划、日志、截图和调度 runner；
+- 本机运行结果和备份。
+
+密码保存在 macOS 钥匙串，不位于 `.state/`。`node_modules/`、`dist/`、日志和 `.DS_Store` 也不会上传。提交或发布前可再次确认：
+
+```bash
+git status --short
+git ls-files | grep -E '(^|/)(\.state|dist|node_modules)/' && echo "ERROR: sensitive path tracked"
+```
+
+正常情况下最后一条命令没有任何输出。
+
+## 12. 开发验证
+
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run build
+```
+
+当前测试覆盖日期与上海时区、周翻页、时段选择重试、双优先级状态与时间屏障、Apple Events 只读探测重试、硬件唤醒时间和提交响应解释。

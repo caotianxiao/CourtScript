@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { EDGE_EXECUTABLE, PROFILE_DIR } from "./constants.js";
@@ -102,11 +102,19 @@ end tell
 
 export async function ensureAppleEventsPreference(): Promise<void> {
   const preferencesPath = join(PROFILE_DIR, "Default", "Preferences");
-  const preferences = JSON.parse(await readFile(preferencesPath, "utf8")) as {
+  await mkdir(join(PROFILE_DIR, "Default"), { recursive: true, mode: 0o700 });
+  let preferences: {
     browser?: Record<string, unknown>;
     profile?: Record<string, unknown>;
     session?: Record<string, unknown>;
-  };
+  } = {};
+  try {
+    preferences = JSON.parse(await readFile(preferencesPath, "utf8")) as typeof preferences;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
   preferences.browser ??= {};
   preferences.browser.allow_javascript_apple_events = true;
   // Edge restores every old tab after a forced/crashed exit.  That makes
@@ -227,21 +235,64 @@ export async function waitForCourtJavaScript<T>(
   accept: (value: T) => boolean,
   timeoutMs: number,
   description: string,
+  options: CourtWaitOptions = {},
 ): Promise<T> {
+  return waitForCourtResult(
+    () => executeCourtJavaScript(javaScript),
+    accept,
+    timeoutMs,
+    description,
+    options,
+  );
+}
+
+export interface CourtWaitOptions {
+  minimumAttempts?: number;
+  retryDelayMs?: number;
+}
+
+export async function waitForCourtResult<T>(
+  execute: () => Promise<string>,
+  accept: (value: T) => boolean,
+  timeoutMs: number,
+  description: string,
+  options: CourtWaitOptions = {},
+): Promise<T> {
+  const minimumAttempts = options.minimumAttempts ?? 1;
+  const retryDelayMs = options.retryDelayMs ?? 300;
+  if (!Number.isInteger(minimumAttempts) || minimumAttempts < 1) {
+    throw new Error("minimumAttempts 必须是正整数");
+  }
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
+    throw new Error("retryDelayMs 必须是非负数");
+  }
   const deadline = Date.now() + timeoutMs;
   let lastValue: T | undefined;
   let lastError: unknown;
-  while (Date.now() < deadline) {
+  let attempts = 0;
+  while (Date.now() < deadline || attempts < minimumAttempts) {
+    attempts += 1;
     try {
-      const output = await executeCourtJavaScript(javaScript);
+      const output = await execute();
       lastValue = JSON.parse(output) as T;
       if (accept(lastValue)) {
         return lastValue;
       }
     } catch (error) {
       lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        message.includes("Apple Events 调用超时")
+        && (Date.now() < deadline || attempts < minimumAttempts)
+      ) {
+        console.warn(
+          `[${new Date().toISOString()}] EDGE_RETRY：${description}第 ${attempts} 次 Apple Events 超时，继续重试`,
+        );
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    if (Date.now() < deadline || attempts < minimumAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
   }
   const detail = lastValue === undefined
     ? (lastError instanceof Error ? lastError.message : String(lastError ?? "无页面结果"))

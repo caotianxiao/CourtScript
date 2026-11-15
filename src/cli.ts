@@ -18,6 +18,8 @@ import {
 import { runReservation } from "./reservation.js";
 import { runPriorityPair } from "./priority.js";
 import {
+  hardwareWakeAt,
+  installHardwareWake,
   installOneShotSchedule,
   installParallelSchedule,
   installPrioritySchedule,
@@ -306,11 +308,19 @@ program
 
 program
   .command("schedule-priority")
-  .description("安装高优先级准点、低优先级随后立即执行的一次性任务")
+  .description("安装高优先级准点、低优先级不早于整点执行的一次性任务")
   .requiredOption("--pair <id>", "优先级计划 ID")
   .requiredOption("--at <ISO-8601>", "高优先级提交时刻，必须包含时区")
   .option("--prepare-minutes <minutes>", "提前登录并保持唤醒的分钟数", "3")
-  .action(async (options: { pair: string; at: string; prepareMinutes: string }) => {
+  .option("--wake-minutes-before <minutes>", "提前设置硬件唤醒的分钟数", "5")
+  .option("--no-wake", "不设置一次性硬件唤醒")
+  .action(async (options: {
+    pair: string;
+    at: string;
+    prepareMinutes: string;
+    wakeMinutesBefore: string;
+    wake: boolean;
+  }) => {
     const selectedPair = await findPriorityPair(options.pair);
     if (selectedPair.status === "confirmed") {
       throw new Error("该优先级计划的两个时段都已预约成功，不会创建重复调度");
@@ -320,19 +330,26 @@ program
     if (!Number.isInteger(prepareMinutes)) {
       throw new Error("--prepare-minutes 必须是整数");
     }
+    const wakeMinutesBefore = Number(options.wakeMinutesBefore);
+    if (!Number.isInteger(wakeMinutesBefore)) {
+      throw new Error("--wake-minutes-before 必须是整数");
+    }
     const releaseDate = releaseDateFor(selectedPair.highDate);
     if (shanghaiDate(at) !== releaseDate) {
       throw new Error(
         `高优先级日期 ${selectedPair.highDate} 应在 ${releaseDate} 抢订，调度日期不匹配`,
       );
     }
+    const wake = options.wake
+      ? await installHardwareWake(hardwareWakeAt(at, wakeMinutesBefore))
+      : undefined;
     const scheduled = await installPrioritySchedule(
       selectedPair.id,
       at,
       prepareMinutes,
     );
     console.log("SCHEDULED：优先级串行任务已安装");
-    console.log(JSON.stringify(scheduled, null, 2));
+    console.log(JSON.stringify({ ...scheduled, wake }, null, 2));
   });
 
 program

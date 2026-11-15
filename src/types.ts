@@ -25,6 +25,15 @@ export interface ReservationResult {
   status: "ready" | "submitted" | "confirmed" | "failed" | "ambiguous";
   message: string;
   launchRequests: number;
+  submission?: {
+    observed: boolean;
+    completed: boolean;
+    outcome: "success" | "failure" | "unknown" | "timeout";
+    elapsedMs: number;
+    httpStatus?: number;
+    applicationCode?: string;
+    responseMessage?: string;
+  };
   screenshot?: string;
 }
 

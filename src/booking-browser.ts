@@ -131,6 +131,7 @@ export async function openAuthenticatedReservationPage(): Promise<void> {
       (state) => Boolean(state.url),
       8_000,
       "连接普通 Edge",
+      { minimumAttempts: 3 },
     );
     if (pageHasChallenge(lastState)) {
       throw new Error("页面出现验证码或滑块，脚本不会尝试绕过");

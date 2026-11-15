@@ -1,4 +1,4 @@
-import { LAUNCH_PATH, RESOURCE_ID } from "./constants.js";
+import { RESOURCE_ID } from "./constants.js";
 import { artifactPaths, writeResultLog } from "./logging.js";
 import {
   captureCourtWindow,
@@ -25,6 +25,8 @@ import {
 export { decideWeekNavigation } from "./week-navigation.js";
 
 const PAGE_TIMEOUT = 30_000;
+const SUBMISSION_OBSERVATION_TIMEOUT_MS = 15_000;
+const SUBMISSION_IN_FLIGHT_TIMEOUT_MS = 60_000;
 
 export interface ReservationRunOptions {
   notBefore?: Date;
@@ -169,6 +171,14 @@ interface SlotUiState {
 
 export type SelectionAction = "confirmed" | "wait" | "click";
 
+export function isSelectedSlotCell(text: string, className: string): boolean {
+  const classes = new Set(className.split(/\s+/).filter(Boolean));
+  return text.includes("可预约")
+    && classes.has("active")
+    && classes.has("can_active")
+    && !classes.has("no_active");
+}
+
 export function decideSelectionAction(
   state: Pick<SlotUiState, "summary" | "phone" | "active">,
 ): SelectionAction {
@@ -187,6 +197,7 @@ function slotUiStateScript(targetDate: string, slots: string[]): string {
   return `(() => {
     const targetDate = ${JSON.stringify(targetDate)};
     const slots = ${JSON.stringify(slots)};
+    const isSelectedSlotCell = ${isSelectedSlotCell.toString()};
     const empty = (extra) => ({
       summary: false,
       phone: false,
@@ -233,11 +244,12 @@ function slotUiStateScript(targetDate: string, slots: string[]): string {
     const details = (slot) => {
       const index = times.indexOf(slot);
       const cell = index >= 0 ? cells[index] : undefined;
+      const text = cell ? cell.innerText.trim() : '';
       return {
         cell,
-        text: cell ? cell.innerText.trim() : '',
+        text,
         summary: hasSummary(slot),
-        active: Boolean(cell && cell.classList.contains('active')),
+        active: Boolean(cell && isSelectedSlotCell(text, cell.className)),
       };
     };
     // Preserve an existing selection even if a later table update changed the
@@ -296,6 +308,7 @@ async function clickLatestSlotCell(
   const output = await executeCourtJavaScript(`(() => {
     const targetDate = ${JSON.stringify(targetDate)};
     const slot = ${JSON.stringify(slot)};
+    const isSelectedSlotCell = ${isSelectedSlotCell.toString()};
     const expected = targetDate + ' ' + slot;
     const summary = Array.from(document.querySelectorAll('*'))
       .some((item) => typeof item.innerText === 'string'
@@ -314,10 +327,10 @@ async function clickLatestSlotCell(
       ? column.querySelectorAll('dd.resource_item_info')[index]
       : undefined;
     if (!cell) return JSON.stringify({state: 'unavailable'});
-    if (summary || cell.classList.contains('active')) {
+    const text = cell.innerText.trim();
+    if (summary || isSelectedSlotCell(text, cell.className)) {
       return JSON.stringify({state: 'pending'});
     }
-    const text = cell.innerText.trim();
     if (!text.includes('可预约') || !cell.classList.contains('can_active')) {
       return JSON.stringify({state: 'unavailable'});
     }
@@ -408,68 +421,309 @@ export async function selectSlot(
   );
 }
 
-async function installLaunchMonitor(): Promise<void> {
-  await executeCourtJavaScript(`(() => {
-    if (!window.__courtScriptLaunchMonitor) {
-      const launchPath = ${JSON.stringify(LAUNCH_PATH)};
+export function launchMonitorJavaScript(): string {
+  return `(() => {
+    if (!window.__courtScriptLaunchMonitor
+        || window.__courtScriptLaunchMonitor.version !== 2) {
+      const launchSuffix = '/site/resource/launch';
+      const isLaunchUrl = (value) => {
+        try {
+          return new URL(String(value), location.href).pathname
+            .replace(/\\/+$/, '')
+            .endsWith(launchSuffix);
+        } catch {
+          return false;
+        }
+      };
       const performanceCount = () => performance.getEntriesByType('resource')
-        .filter((entry) => {
-          try {
-            return new URL(entry.name, location.href).pathname === launchPath;
-          } catch {
-            return false;
-          }
-        }).length;
+        .filter((entry) => isLaunchUrl(entry.name)).length;
       window.__courtScriptLaunchMonitor = {
-        count: 0,
+        version: 2,
+        events: [],
         performanceBaseline: performanceCount(),
+      };
+      const monitor = window.__courtScriptLaunchMonitor;
+      const begin = (transport, url, method) => {
+        const event = {
+          transport,
+          url: String(url || ''),
+          method: String(method || 'GET').toUpperCase(),
+          startedAt: Date.now(),
+        };
+        monitor.events.push(event);
+        return event;
+      };
+      const finish = (event, status, body, error) => {
+        if (!event || event.completedAt) return;
+        event.completedAt = Date.now();
+        event.status = Number(status) || 0;
+        event.body = typeof body === 'string' ? body.slice(0, 4000) : '';
+        event.error = error ? String(error).slice(0, 500) : '';
       };
       const originalFetch = window.fetch;
       if (originalFetch) {
         window.fetch = function(input, init) {
           const url = typeof input === 'string' ? input : input && input.url;
-          if (url && new URL(url, location.href).pathname === launchPath) {
-            window.__courtScriptLaunchMonitor.count += 1;
+          if (!url || !isLaunchUrl(url)) {
+            return originalFetch.call(this, input, init);
           }
-          return originalFetch.call(this, input, init);
+          const event = begin('fetch', url, init && init.method);
+          return originalFetch.call(this, input, init).then((response) => {
+            const copy = response.clone();
+            copy.text()
+              .then((body) => finish(event, response.status, body, ''))
+              .catch((error) => finish(event, response.status, '', error));
+            return response;
+          }).catch((error) => {
+            finish(event, 0, '', error);
+            throw error;
+          });
         };
       }
       const originalOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url, ...rest) {
         this.__courtScriptUrl = String(url);
+        this.__courtScriptMethod = String(method);
         return originalOpen.call(this, method, url, ...rest);
       };
       const originalSend = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.send = function(body) {
-        if (this.__courtScriptUrl
-            && new URL(this.__courtScriptUrl, location.href).pathname === launchPath) {
-          window.__courtScriptLaunchMonitor.count += 1;
+        if (!this.__courtScriptUrl || !isLaunchUrl(this.__courtScriptUrl)) {
+          return originalSend.call(this, body);
         }
+        const event = begin(
+          'xhr',
+          this.__courtScriptUrl,
+          this.__courtScriptMethod,
+        );
+        this.addEventListener('loadend', () => {
+          let responseBody = '';
+          try {
+            if (typeof this.responseText === 'string') {
+              responseBody = this.responseText;
+            }
+          } catch {}
+          if (!responseBody && this.response != null) {
+            try {
+              responseBody = typeof this.response === 'string'
+                ? this.response
+                : JSON.stringify(this.response);
+            } catch {}
+          }
+          finish(event, this.status, responseBody, this.status ? '' : 'loadend-status-0');
+        }, {once: true});
         return originalSend.call(this, body);
       };
     }
     return JSON.stringify({installed: true});
-  })()`);
+  })()`;
+}
+
+async function installLaunchMonitor(): Promise<void> {
+  await executeCourtJavaScript(launchMonitorJavaScript());
 }
 
 async function countLaunchRequests(): Promise<number> {
   const output = await executeCourtJavaScript(`(() => {
     const monitor = window.__courtScriptLaunchMonitor;
-    const launchPath = ${JSON.stringify(LAUNCH_PATH)};
+    const launchSuffix = '/site/resource/launch';
     const performanceCount = performance.getEntriesByType('resource')
       .filter((entry) => {
         try {
-          return new URL(entry.name, location.href).pathname === launchPath;
+          return new URL(entry.name, location.href).pathname
+            .replace(/\\/+$/, '')
+            .endsWith(launchSuffix);
         } catch {
           return false;
         }
       }).length - (monitor?.performanceBaseline ?? 0);
     return JSON.stringify({
-      count: Math.max(monitor?.count ?? 0, performanceCount, 0),
+      count: Math.max(monitor?.events?.length ?? 0, performanceCount, 0),
     });
   })()`);
   const result = JSON.parse(output) as { count?: number };
   return Number(result.count) || 0;
+}
+
+interface LaunchMonitorEvent {
+  transport?: string;
+  url?: string;
+  method?: string;
+  startedAt?: number;
+  completedAt?: number;
+  status?: number;
+  body?: string;
+  error?: string;
+}
+
+interface LaunchMonitorSnapshot {
+  eventCount: number;
+  performanceCount: number;
+  latest?: LaunchMonitorEvent;
+  pageText: string;
+}
+
+export interface SubmissionInterpretation {
+  outcome: "success" | "failure" | "unknown";
+  applicationCode?: string;
+  responseMessage?: string;
+}
+
+function responseFields(body: string): {
+  applicationCode?: string;
+  responseMessage?: string;
+  success?: boolean;
+} {
+  if (!body.trim()) return {};
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const values = [parsed, parsed.data, parsed.result]
+      .filter((value): value is Record<string, unknown> =>
+        Boolean(value) && typeof value === "object" && !Array.isArray(value)
+      );
+    const pick = (keys: string[]): unknown => {
+      for (const value of values) {
+        for (const key of keys) {
+          if (value[key] !== undefined && value[key] !== null) return value[key];
+        }
+      }
+      return undefined;
+    };
+    const code = pick(["code", "statusCode", "errno"]);
+    const message = pick(["message", "msg", "error", "errorMessage"]);
+    const success = pick(["success", "ok"]);
+    return {
+      applicationCode: code === undefined ? undefined : String(code).slice(0, 80),
+      responseMessage: typeof message === "string"
+        ? message.replace(/\s+/g, " ").trim().slice(0, 300)
+        : undefined,
+      success: typeof success === "boolean" ? success : undefined,
+    };
+  } catch {
+    return {
+      responseMessage: body.replace(/\s+/g, " ").trim().slice(0, 300) || undefined,
+    };
+  }
+}
+
+export function interpretSubmissionResponse(
+  httpStatus: number | undefined,
+  body: string,
+  error = "",
+): SubmissionInterpretation {
+  const fields = responseFields(body);
+  const message = fields.responseMessage ?? "";
+  const failureText = /预约失败|已约满|已被预约|已被占用|没有余量|余量不足|资源不足|不可预约|无法预约|预约冲突|重复预约|超过.*上限|未开放|已过期|失败|error/i;
+  const successText = /预约成功|提交成功|操作成功|成功预约|success/i;
+  if (error || httpStatus === 0 || (httpStatus !== undefined && httpStatus >= 400)) {
+    return { outcome: "failure", ...fields };
+  }
+  if (fields.success === false || failureText.test(message)) {
+    return { outcome: "failure", ...fields };
+  }
+  if (fields.success === true || successText.test(message)) {
+    return { outcome: "success", ...fields };
+  }
+  return { outcome: "unknown", ...fields };
+}
+
+async function readLaunchMonitorSnapshot(): Promise<LaunchMonitorSnapshot> {
+  const output = await executeCourtJavaScript(`(() => {
+    const monitor = window.__courtScriptLaunchMonitor;
+    const launchSuffix = '/site/resource/launch';
+    const performanceCount = performance.getEntriesByType('resource')
+      .filter((entry) => {
+        try {
+          return new URL(entry.name, location.href).pathname
+            .replace(/\\/+$/, '')
+            .endsWith(launchSuffix);
+        } catch {
+          return false;
+        }
+      }).length - (monitor?.performanceBaseline ?? 0);
+    const events = monitor?.events ?? [];
+    return JSON.stringify({
+      eventCount: events.length,
+      performanceCount: Math.max(performanceCount, 0),
+      latest: events.length ? events[events.length - 1] : undefined,
+      pageText: (document.body?.innerText || '').slice(-1200),
+    });
+  })()`);
+  return JSON.parse(output) as LaunchMonitorSnapshot;
+}
+
+async function waitForSubmissionReceipt(clickedAt: number): Promise<NonNullable<
+  ReservationResult["submission"]
+>> {
+  let deadline = clickedAt + SUBMISSION_OBSERVATION_TIMEOUT_MS;
+  let lastSnapshot: LaunchMonitorSnapshot | undefined;
+  while (Date.now() < deadline) {
+    lastSnapshot = await readLaunchMonitorSnapshot();
+    const latest = lastSnapshot.latest;
+    if (latest?.startedAt && !latest.completedAt) {
+      deadline = Math.max(
+        deadline,
+        latest.startedAt + SUBMISSION_IN_FLIGHT_TIMEOUT_MS,
+      );
+    }
+    if (latest?.completedAt) {
+      const interpretation = interpretSubmissionResponse(
+        latest.status,
+        latest.body ?? "",
+        latest.error ?? "",
+      );
+      return {
+        observed: true,
+        completed: true,
+        outcome: interpretation.outcome,
+        elapsedMs: Math.max(0, latest.completedAt - clickedAt),
+        httpStatus: latest.status,
+        applicationCode: interpretation.applicationCode,
+        responseMessage: interpretation.responseMessage,
+      };
+    }
+    if ((lastSnapshot.performanceCount ?? 0) > 0) {
+      const pageInterpretation = interpretSubmissionResponse(
+        undefined,
+        lastSnapshot.pageText,
+      );
+      return {
+        observed: true,
+        completed: true,
+        outcome: pageInterpretation.outcome,
+        elapsedMs: Math.max(0, Date.now() - clickedAt),
+        responseMessage: pageInterpretation.responseMessage,
+      };
+    }
+    const pageInterpretation = interpretSubmissionResponse(
+      undefined,
+      lastSnapshot.pageText,
+    );
+    // A toast is only a fallback when no request hook fired. If a real fetch
+    // or XHR is still pending, never close its browser based on page text.
+    if (
+      (lastSnapshot.eventCount ?? 0) === 0
+      && pageInterpretation.outcome !== "unknown"
+    ) {
+      return {
+        observed: (lastSnapshot.eventCount ?? 0) > 0,
+        completed: true,
+        outcome: pageInterpretation.outcome,
+        elapsedMs: Math.max(0, Date.now() - clickedAt),
+        responseMessage: pageInterpretation.responseMessage,
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return {
+    observed: Boolean(
+      (lastSnapshot?.eventCount ?? 0) > 0
+      || (lastSnapshot?.performanceCount ?? 0) > 0
+    ),
+    completed: false,
+    outcome: "timeout",
+    elapsedMs: Math.max(0, Date.now() - clickedAt),
+  };
 }
 
 async function captchaVisible(): Promise<boolean> {
@@ -479,7 +733,7 @@ async function captchaVisible(): Promise<boolean> {
   return Boolean((JSON.parse(output) as { challenge?: boolean }).challenge);
 }
 
-async function submitReservation(targetDate: string, slot: string): Promise<void> {
+async function submitReservation(targetDate: string, slot: string): Promise<number> {
   const output = await executeCourtJavaScript(`(() => {
     const expected = ${JSON.stringify(`${targetDate} ${slot}`)};
     const summary = Array.from(document.querySelectorAll('*'))
@@ -502,6 +756,7 @@ async function submitReservation(targetDate: string, slot: string): Promise<void
   if (!result.clicked) {
     throw new Error("页面缺少“确认预约”按钮");
   }
+  return Date.now();
 }
 
 async function verifyAppointment(targetDate: string, slot: string): Promise<boolean> {
@@ -633,29 +888,50 @@ export async function runReservation(
       throw new Error("页面出现验证码或滑块，脚本不会尝试绕过");
     }
     console.log(`[${new Date().toISOString()}] RUN_PHASE：二次核验通过，单次点击确认预约`);
-    await submitReservation(plan.targetDate, selectedSlot);
+    const submittedAt = await submitReservation(plan.targetDate, selectedSlot);
     if (options.deferVerification) {
-      // Give the page's click handler enough time to dispatch its request, but
-      // do not block the next priority on screenshots or My Reservation.
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      launchRequests = await countLaunchRequests();
+      // Keep this exact browser alive until the booking request has completed.
+      // A fixed short delay can terminate a slow in-flight POST when finally
+      // closes the dedicated Edge before the low-priority run starts.
+      const submission = await waitForSubmissionReceipt(submittedAt);
+      launchRequests = Math.max(
+        submission.observed ? 1 : 0,
+        await countLaunchRequests(),
+      );
+      console.log(
+        `[${new Date().toISOString()}] RUN_PHASE：提交响应判定 `
+        + `observed=${submission.observed} completed=${submission.completed} `
+        + `outcome=${submission.outcome} http=${submission.httpStatus ?? "unknown"} `
+        + `elapsedMs=${submission.elapsedMs}`,
+      );
       if (launchRequests > 1) {
         throw new Error(`预约提交请求次数异常：${launchRequests}`);
       }
+      if (submission.outcome === "failure") {
+        throw new Error(
+          `预约接口明确返回失败`
+          + `${submission.httpStatus ? `（HTTP ${submission.httpStatus}）` : ""}`
+          + `${submission.responseMessage ? `：${submission.responseMessage}` : ""}`,
+        );
+      }
+      const status = submission.completed ? "submitted" : "ambiguous";
       const result: ReservationResult = {
         mode,
         planId: plan.id,
         targetDate: plan.targetDate,
         selectedSlot,
-        status: "submitted",
-        message: `已提交，延后核验：${plan.targetDate} ${selectedSlot}`,
+        status,
+        message: submission.completed
+          ? `预约请求已完成，延后核验：${plan.targetDate} ${selectedSlot}`
+          : `确认预约已点击，但 ${submission.elapsedMs}ms 内未取得完整响应，禁止自动重试`,
         launchRequests,
+        submission,
       };
       await writeResultLog(artifacts.logPath, result);
       await updatePlan(
         plan.id,
-        "submitted",
-        { at: new Date().toISOString(), mode, slot: selectedSlot, result: "submitted" },
+        status,
+        { at: new Date().toISOString(), mode, slot: selectedSlot, result: status },
         result,
       );
       return result;

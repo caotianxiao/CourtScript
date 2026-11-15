@@ -1,7 +1,13 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-export const PROJECT_ROOT = process.cwd();
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+
+// `courtscript` is normally installed through `npm link`, so callers may run
+// it from any working directory. Both src/ (tsx) and dist/ (compiled CLI) live
+// one level below the repository root.
+export const PROJECT_ROOT = resolve(MODULE_DIR, "..");
 export const STATE_DIR = join(PROJECT_ROOT, ".state");
 export const PLANS_FILE = join(STATE_DIR, "plans.json");
 export const PROFILE_DIR = join(STATE_DIR, "edge-profile");
